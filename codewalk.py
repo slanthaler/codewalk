@@ -237,7 +237,7 @@ def css_class(ttype) -> str:
 RULES = """\
 You are walking a researcher through the codebase rooted at {root}, which they are reading in a \
 local three-pane dashboard: file tree, open file, and this conversation.
-{inherited}{brief}
+{inherited}
 Use your Read, Grep and Glob tools freely to pull up whatever you need — do not ask them to paste \
 code, and do not guess at contents you have not read. You have no other tools; you cannot run \
 anything or write to disk.
@@ -277,7 +277,7 @@ The user can attach code to a question. When they do, the exact text arrives abo
 under a REFERENCES heading, with the path and line numbers. That attached code is what they are \
 asking about — answer about it directly, and do not re-read those lines unless you need surrounding \
 context.
-"""
+{brief}"""
 
 
 INHERITED_NOTE = """
@@ -312,7 +312,12 @@ class Claude:
         self.model = model
         self.root = root
         self.parent = parent
-        self.brief = ("\nYOUR BRIEF FOR THIS SESSION\n\n" + brief.strip() + "\n") if brief.strip() else ""
+        self.brief = (
+            "\n\n=== YOUR BRIEF FOR THIS SESSION ===\n\n"
+            + brief.strip()
+            + "\n\nThis brief was written for this session specifically. Where it conflicts with the "
+              "general guidance above, the brief wins.\n"
+        ) if brief.strip() else ""
 
         self.session_id: str | None = None
         self.lock = threading.Lock()
@@ -419,12 +424,12 @@ class Claude:
         return True
 
 
-def render_transcript(turns: list) -> str:
+def render_transcript(turns: list, numbered_from: int = 1) -> str:
     """The dashboard conversation, written so the terminal session can absorb it verbatim."""
     if not turns:
         return "(no exchanges — the dashboard was closed without asking anything)\n"
     out = [f"# Dashboard conversation — {len(turns)} exchange(s)", ""]
-    for i, t in enumerate(turns, 1):
+    for i, t in enumerate(turns, numbered_from):
         out.append(f"## {i}. User")
         if t["context"].strip():
             out.append("")
@@ -477,6 +482,8 @@ class Handler(BaseHTTPRequestHandler):
     transcript_path: str | None = None
     handback = threading.Event()
     last_ping: float = 0.0
+    sync_path: str | None = None
+    synced_upto: int = 0
     first_question: str = ""
 
     def log_message(self, fmt, *args):
@@ -514,6 +521,9 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path == "/":
             self._send(200, "text/html; charset=utf-8", PAGE.encode("utf-8"))
+        elif path == "/api/ping":
+            Handler.last_ping = time.time()      # the tab is still open (fetch() == GET)
+            self._json({"ok": True})
         elif path == "/api/tree":
             self._json({
                 "root": self.repo.root,
@@ -522,6 +532,7 @@ class Handler(BaseHTTPRequestHandler):
                 "context": Handler.context_label,
                 "handoff": Handler.handoff,
                 "first_question": Handler.first_question,
+                "sync": bool(Handler.sync_path),
                 "files": self.repo.files(),
             })
         elif path == "/api/file":
@@ -558,9 +569,11 @@ class Handler(BaseHTTPRequestHandler):
             except (KeyError, TypeError, ValueError):
                 res = {"ok": False, "error": "Malformed edit."}
             self._json(res)
-        elif path == "/api/ping":
-            Handler.last_ping = time.time()
-            self._json({"ok": True})
+        elif path == "/api/sync":
+            b = self._body()
+            self._json(Handler.sync(bool(b.get("close"))))
+            if b.get("close"):
+                Handler.handback.set()
         elif path == "/api/handback":
             self._json({"ok": True, "turns": len(Handler.transcript)})
             Handler.handback.set()
@@ -614,6 +627,30 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
     @classmethod
+    def sync(cls, closing: bool) -> dict:
+        """Publish everything said since the last sync, for the terminal session to pick up."""
+        if not cls.sync_path:
+            return {"ok": False, "error": "This dashboard was not started with --sync-file."}
+        fresh = cls.transcript[cls.synced_upto:]
+        if not fresh and not closing:
+            return {"ok": False, "error": "Nothing new to sync."}
+        header = (
+            "# Synced from the codewalk dashboard"
+            + (" (session closed)" if closing else "")
+            + f" — {len(fresh)} new exchange(s)\n\n"
+        )
+        body = header + render_transcript(fresh, numbered_from=cls.synced_upto + 1)
+        tmp = cls.sync_path + ".part"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            os.replace(tmp, cls.sync_path)      # atomic: the watcher never sees a half file
+        except OSError as e:
+            return {"ok": False, "error": f"Could not write the sync file: {e}"}
+        cls.synced_upto = len(cls.transcript)
+        return {"ok": True, "synced": len(fresh)}
+
+    @classmethod
     def record(cls, question, context, answer, tools):
         cls.transcript.append({
             "q": question, "context": context, "a": answer, "tools": tools,
@@ -665,12 +702,18 @@ body {
   padding: 0 10px; gap: 12px; font-size: 12px; color: var(--fg-dim); user-select: none;
 }
 .titlebar .brand { color: var(--fg-faint); letter-spacing: 0.09em; text-transform: uppercase; font-size: 10px; }
-#handback {
+#handback, #syncbar button {
   font: inherit; font-size: 11px; font-family: var(--ui); background: var(--btn); color: #fff;
-  border: 0; border-radius: 2px; padding: 3px 10px; cursor: pointer; margin-left: auto;
+  border: 0; border-radius: 2px; padding: 3px 10px; cursor: pointer;
 }
-#handback:hover:not(:disabled) { background: var(--btn-hover); }
-#handback:disabled { background: #2d2d2d; color: var(--fg-faint); cursor: default; }
+#syncbar { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+#handback { margin-left: auto; }
+#syncbar + #handback { margin-left: 6px; }
+#handback:hover:not(:disabled), #syncbar button:hover:not(:disabled) { background: var(--btn-hover); }
+#handback:disabled, #syncbar button:disabled { background: #2d2d2d; color: var(--fg-faint); cursor: default; }
+#syncbar button.ghost { background: transparent; color: var(--fg-dim); border: 1px solid var(--border); }
+#syncbar button.ghost:hover:not(:disabled) { background: var(--bg-hover); color: #fff; }
+#syncnote { font-size: 11px; color: var(--green); margin-left: 2px; }
 .titlebar .center { flex: 1; text-align: center; color: var(--fg-faint); }
 
 .main { flex: 1 1 auto; display: flex; min-height: 0; }
@@ -851,6 +894,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
 <div class="titlebar">
   <span class="brand">codewalk</span>
   <span class="center" id="titleRoot">—</span>
+  <span id="syncbar" hidden><button id="syncNow">Sync to terminal</button><button id="syncClose" class="ghost">Sync &amp; close</button></span>
   <button id="handback" hidden>Return to terminal</button>
 </div>
 
@@ -1747,6 +1791,52 @@ textarea:focus { outline: none; border-color: var(--accent); }
   makeSash($("sash1"), $("explorer"), "left");
   makeSash($("sash2"), $("chat"), "right");
 
+  // ---------------- sync to the terminal session ----------------
+  // One-way the other way: publish what was said here so the terminal Claude can pick it up.
+  function setupSync() {
+    const bar = $("syncbar"), now = $("syncNow"), close = $("syncClose");
+    bar.hidden = false;
+    const note = document.createElement("span");
+    note.id = "syncnote";
+    bar.appendChild(note);
+
+    async function push(closing) {
+      now.disabled = close.disabled = true;
+      note.style.color = "";
+      note.textContent = closing ? "Syncing and closing\u2026" : "Syncing\u2026";
+      let res = null;
+      try {
+        res = await fetch("/api/sync", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ close: !!closing }),
+        }).then((r) => r.json());
+      } catch (e) {
+        res = { ok: false, error: "Could not reach the server." };
+      }
+      if (closing && res && res.ok) {
+        document.body.innerHTML =
+          "<div style='padding:60px;font-family:system-ui;color:#858585;font-size:14px;line-height:1.7'>" +
+          "Synced to the terminal \u2014 " + res.synced + " exchange(s) sent. You can close this tab.</div>";
+        return;
+      }
+      now.disabled = close.disabled = false;
+      if (res && res.ok) {
+        note.style.color = "var(--green)";
+        note.textContent = "sent " + res.synced;
+        setTimeout(() => { note.textContent = ""; }, 4000);
+      } else {
+        note.style.color = "var(--red)";
+        note.textContent = (res && res.error) || "sync failed";
+      }
+    }
+
+    now.onclick = () => push(false);
+    close.onclick = () => push(true);
+    document.addEventListener("keydown", (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); push(false); }
+    });
+  }
+
   // ---------------- boot ----------------
   fetch("/api/tree").then((r) => r.json()).then((d) => {
     allFiles = d.files;
@@ -1767,6 +1857,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
       };
     }
     if (d.handoff) setInterval(() => { fetch("/api/ping").catch(() => {}); }, 3000);
+    if (d.sync) setupSync();
     renderTree();
     const b = bubble("Claude").querySelector(".body");
     b.innerHTML =
@@ -1816,6 +1907,9 @@ def main():
                     help="a file of instructions for the dashboard session (added to --brief)")
     ap.add_argument("--start", default="", metavar="QUESTION",
                     help="ask this the moment the page opens, so the walkthrough begins by itself")
+    ap.add_argument("--sync-file", default=None, metavar="PATH",
+                    help="show Sync buttons that publish the conversation to PATH, for a terminal "
+                         "session to pick up. Works with or without --handoff.")
     ap.add_argument("--idle-exit", type=int, default=15, metavar="SECONDS",
                     help="with --handoff, return to the terminal this long after the tab is closed")
     ap.add_argument("--no-open", action="store_true")
@@ -1843,6 +1937,7 @@ def main():
             sys.exit(f"codewalk: could not read --brief-file: {e}")
 
     Handler.first_question = args.start
+    Handler.sync_path = os.path.abspath(args.sync_file) if args.sync_file else None
     Handler.repo = Repo(args.root)
     Handler.claude = Claude(args.model, Handler.repo.root, parent, brief)
     n = len(Handler.repo.files())
@@ -1853,6 +1948,8 @@ def main():
     print(f"          {url}   (ctrl-c to stop)")
     if parent:
         print(f"          chat forks session {parent} (your original is not modified)")
+    if Handler.sync_path:
+        print(f"          sync button writes {Handler.sync_path}")
     if lex is None:
         print("          note: Pygments not found — showing plain text")
     if not args.no_open:
