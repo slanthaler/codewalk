@@ -22,6 +22,7 @@ Standard library only, plus Pygments for highlighting (optional — falls back t
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
 import json
 import os
@@ -191,6 +192,170 @@ class Repo:
         }
 
 
+def default_shadow(root: str) -> str:
+    """Outside the repo on purpose: the file tree comes from `git ls-files`, so a shadow
+    inside the root would either pollute the tree or be invisible to it."""
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    tag = hashlib.sha256(os.path.abspath(root).encode("utf-8")).hexdigest()[:8]
+    return os.path.join(base, "codewalk", "shadow", f"{os.path.basename(root.rstrip(os.sep))}-{tag}")
+
+
+class Shadow:
+    """A sparse mirror of the repo holding proposals the user has not agreed to yet.
+
+    Sparse is the point: a file exists here only because there is a pending proposal for it,
+    so presence *is* the signal and no read ever has to ask which tree is authoritative.
+    """
+
+    def __init__(self, root: str, repo: "Repo"):
+        self.root = os.path.abspath(root)
+        self.repo = repo
+        os.makedirs(self.root, exist_ok=True)
+
+    def resolve(self, rel: str) -> str | None:
+        rel = rel.lstrip("/")
+        if not rel:
+            return None
+        candidate = os.path.realpath(os.path.join(self.root, rel))
+        root = os.path.realpath(self.root)
+        if candidate != root and not candidate.startswith(root + os.sep):
+            return None
+        return candidate
+
+    def entries(self) -> list[dict]:
+        out = []
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            dirnames[:] = [d for d in dirnames if d != ".git"]
+            for fn in sorted(filenames):
+                full = os.path.join(dirpath, fn)
+                rel = os.path.relpath(full, self.root).replace(os.sep, "/")
+                try:
+                    new_text = open(full, encoding="utf-8", errors="replace").read()
+                except OSError:
+                    continue
+                base = self.repo.resolve(rel)
+                old_text = ""
+                is_new = True
+                if base and os.path.isfile(base):
+                    is_new = False
+                    try:
+                        old_text = open(base, encoding="utf-8", errors="replace").read()
+                    except OSError:
+                        old_text = ""
+                added = removed = 0
+                for line in difflib.unified_diff(
+                    old_text.splitlines(), new_text.splitlines(), n=0, lineterm=""
+                ):
+                    if line.startswith("+") and not line.startswith("+++"):
+                        added += 1
+                    elif line.startswith("-") and not line.startswith("---"):
+                        removed += 1
+                out.append({
+                    "path": rel, "new": is_new, "added": added, "removed": removed,
+                    "same": (not is_new) and old_text == new_text,
+                })
+        out.sort(key=lambda e: e["path"])
+        return out
+
+    def read(self, rel: str) -> dict:
+        full = self.resolve(rel)
+        if full is None or not os.path.isfile(full):
+            return {"error": f"No proposal for {rel}"}
+        try:
+            text = open(full, encoding="utf-8", errors="replace").read()
+        except OSError as e:
+            return {"error": f"Could not read the proposal: {e}"}
+        base = self.repo.resolve(rel)
+        old = ""
+        is_new = True
+        if base and os.path.isfile(base):
+            is_new = False
+            try:
+                old = open(base, encoding="utf-8", errors="replace").read()
+            except OSError:
+                old = ""
+        # Mark which lines are new relative to the repo, so the pane can rail them.
+        sm = difflib.SequenceMatcher(None, old.splitlines(), text.splitlines())
+        changed = []
+        for tag, _i1, _i2, j1, j2 in sm.get_opcodes():
+            if tag in ("replace", "insert"):
+                changed.extend(range(j1 + 1, j2 + 1))
+        return {
+            "path": rel,
+            "name": os.path.basename(rel),
+            "digest": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
+            "mtime": os.path.getmtime(full),
+            "lines": tokenize(text, full),
+            "proposed": True,
+            "new": is_new,
+            "changed": changed,
+            "diff": self.diff_text(rel),
+        }
+
+    def diff_text(self, rel: str) -> list[dict]:
+        """Unified diff as rows the chat/pane can render without a diff library."""
+        full = self.resolve(rel)
+        if full is None or not os.path.isfile(full):
+            return []
+        new_text = open(full, encoding="utf-8", errors="replace").read()
+        base = self.repo.resolve(rel)
+        old_text = ""
+        if base and os.path.isfile(base):
+            old_text = open(base, encoding="utf-8", errors="replace").read()
+        rows = []
+        for line in difflib.unified_diff(
+            old_text.splitlines(), new_text.splitlines(),
+            fromfile=rel, tofile=rel, lineterm="",
+        ):
+            if line.startswith("+++") or line.startswith("---"):
+                continue
+            kind = "hunk" if line.startswith("@@") else (
+                "plus" if line.startswith("+") else "minus" if line.startswith("-") else "same"
+            )
+            rows.append({"k": kind, "t": line})
+        return rows
+
+    def apply(self, rel: str) -> dict:
+        """Move a proposal into the repo, backing up whatever was there."""
+        full = self.resolve(rel)
+        if full is None or not os.path.isfile(full):
+            return {"ok": False, "error": f"No proposal for {rel}"}
+        dest = self.repo.resolve(rel)
+        if dest is None:
+            return {"ok": False, "error": "That path is outside the project."}
+        try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            if os.path.isfile(dest):
+                shutil.copyfile(dest, dest + ".codewalk.bak")
+            shutil.copyfile(full, dest)
+            os.remove(full)
+            self._prune()
+        except OSError as e:
+            return {"ok": False, "error": f"Could not apply: {e}"}
+        return {"ok": True, "path": rel}
+
+    def discard(self, rel: str) -> dict:
+        full = self.resolve(rel)
+        if full is None or not os.path.isfile(full):
+            return {"ok": False, "error": f"No proposal for {rel}"}
+        try:
+            os.remove(full)
+            self._prune()
+        except OSError as e:
+            return {"ok": False, "error": f"Could not discard: {e}"}
+        return {"ok": True, "path": rel}
+
+    def _prune(self) -> None:
+        """Drop directories the last proposal just left behind."""
+        for dirpath, dirnames, filenames in os.walk(self.root, topdown=False):
+            if dirpath == self.root or dirnames or filenames:
+                continue
+            try:
+                os.rmdir(dirpath)
+            except OSError:
+                pass
+
+
 def tokenize(text: str, path: str) -> list[list[dict]]:
     """Split into lines of {c: css-class, t: text}. Tokens never straddle a newline."""
     lines: list[list[dict]] = [[]]
@@ -235,18 +400,43 @@ def css_class(ttype) -> str:
 # ----------------------------------------------------------------------------------
 
 RULES = """\
-You are walking a researcher through the codebase rooted at {root}, which they are reading in a \
-local three-pane dashboard: file tree, open file, and this conversation.
+You are the guide inside codewalk: a local three-pane dashboard the reader is looking at RIGHT \
+NOW, walking them through the codebase rooted at {root}.
+
+    left     the file tree
+    center   the file you last opened, scrolled to the lines you last highlighted
+    right    this conversation
+
+The center pane is yours and it persists — whatever you opened last is still on their screen, so \
+you can talk about it as something they can see. Never ask them to paste code, to open a file \
+themselves, or to scroll somewhere; open it for them.
 {inherited}
-Use your Read, Grep and Glob tools freely to pull up whatever you need — do not ask them to paste \
-code, and do not guess at contents you have not read. You have no other tools; you cannot run \
-anything or write to disk.
+Use your Read, Grep and Glob tools freely to pull up whatever you need, and never cite a line you \
+have not read — a wrong line number costs you their trust faster than a vague answer does. You \
+cannot run commands; you can write files, under the rules in directive 5.
 
-Answer in plain prose. No headings, no bullet lists, no code fences, no preamble, no restating the \
-question. A few short paragraphs at most unless they ask for depth. They are a strong engineer, so \
-be concrete and skip the basics.
+Each reply becomes a titled CELL in the right-hand pane, pinned so its first line sits at the top \
+of their view while the rest fills in underneath. They start reading the moment your first words \
+land, so those words must carry the point: no preamble, no restating the question, no throat \
+clearing. They can also jump back through earlier cells by title, which is what the titles are for.
 
-You drive their center pane with two directives, and you should use them constantly:
+Whatever they ask — a direct question, a design discussion, a review of something they are \
+about to build — your first move is to put the relevant code in front of them. Find it, open it at \
+the exact lines with [[open:...]], and say briefly what it does and why it matters. A question like \
+"which transformer architecture is this" is answered by opening the class and the two lines that \
+give it away, not by describing them from memory. Showing beats telling every time, and a short \
+answer anchored on real lines is worth more than a long one that is not.
+
+This holds when the code does not exist yet. If you are thinking through a new implementation with \
+them, keep opening the code it would touch, sit next to, or replace — a design conversation \
+grounded in the actual call sites stays honest in a way an abstract one does not.
+
+Answer in plain prose. No headings, no bullet lists. A few short paragraphs at \
+most unless they ask for depth. They are a strong engineer, so be concrete and skip the basics. \
+Say why the code is the way it is — the shape of the trade-off, what would break if it were \
+written the obvious way — rather than narrating what the lines they can already see literally do.
+
+You drive their center pane with six directives, and you should use them constantly:
 
 1. To point at code, write [[open:PATH:START-END|short label]] inline, exactly where you would \
 otherwise have written "see model.py lines 120-140". PATH is relative to the project root. The pane \
@@ -260,9 +450,15 @@ the file you read.
 the complete replacement text for those lines
 [[/edit]]
 
-which the dashboard shows as a diff with an Apply button; the user decides. Give the full \
-replacement for that line range, indented exactly as it must appear in the file. Only when they ask \
-for a change, and one edit block per message.
+which the dashboard renders as a real diff — deletions and insertions, line by line — with an \
+Apply button the user may or may not press. Give the full replacement for that line range, \
+indented exactly as it must appear in the file.
+
+Reach for this whenever a change is what you are discussing, not only when they ask you to make \
+one. "What if this took a mask instead" is a diff; so is showing two ways to do the same thing as \
+two blocks. Seeing the exact lines that would go and the exact lines that would arrive is what \
+makes the discussion precise, and Apply stays theirs to ignore.
+
 
 3. To pace a walkthrough, end a step with
 
@@ -273,12 +469,44 @@ one bite. A step is ONE idea: at most two short paragraphs and one to three [[op
 then stop and let them press it. Never deliver a whole tour in a single message — a reader cannot
 follow at the speed you write. If there is nothing more to say, leave it out.
 
+The dashboard may run the next step BEFORE the reader has pressed anything, so that Continue feels \
+instant. A step therefore has to stand on its own: never open by referring to what they just \
+clicked, asked or looked at, and never assume which file is in front of them beyond the one you \
+opened yourself.
+
+4. Begin EVERY reply — without exception, including short answers to questions — with
+
+[[title: three to six words]]
+
+on its own first line, naming what that reply is about. It is stripped from the prose and used as \
+the heading on that cell, so the reader can scan back through the walkthrough and find it again. \
+Name the specific subject, not the genre: "RevIN running statistics" or "why the mask is \
+concatenated", never "Explanation" or "Next step". Do not repeat the title in the body text.
+
+5. To draft a NEW file, or a rewrite too large to read as a diff, write it into the shadow \
+directory at {shadow}. Mirror the repo's own layout inside it: a proposed \
+src/models/encoder.py goes to {shadow}/src/models/encoder.py. The dashboard lists everything \
+there as a pending proposal the user can open, diff against the real file, and apply or discard. \
+Nothing you put there touches their code, so draft freely — but say in the chat what you wrote and \
+why, because a file appearing with no explanation is not a discussion.
+
+You may also write directly into the repo at {root}, and that is a real change to their code. Do \
+it only when they have actually agreed to that specific change; while anything is still being \
+discussed, draft it in the shadow instead. When in doubt, shadow.
+
+6. To show code that is NOT in the repo — a proposed new function, a sketch, a snippet from \
+elsewhere — use a fenced ``` block. That is the one place fences belong. Code that IS in the repo \
+must be shown with [[open:...]] instead, so they see it in context in the center pane with the \
+real line numbers around it.
+
 The user can attach code to a question. When they do, the exact text arrives above their message \
 under a REFERENCES heading, with the path and line numbers. That attached code is what they are \
 asking about — answer about it directly, and do not re-read those lines unless you need surrounding \
 context.
 {brief}"""
 
+
+CONTINUE_PROMPT = "Continue."
 
 INHERITED_NOTE = """
 This conversation is a fork of the terminal session where the user and you designed and built this
@@ -308,10 +536,12 @@ class Claude:
     means the user's own terminal session is never written to.
     """
 
-    def __init__(self, model: str, root: str, parent: str | None = None, brief: str = ""):
+    def __init__(self, model: str, root: str, parent: str | None = None, brief: str = "",
+                 shadow: str | None = None):
         self.model = model
         self.root = root
         self.parent = parent
+        self.shadow = shadow
         self.brief = (
             "\n\n=== YOUR BRIEF FOR THIS SESSION ===\n\n"
             + brief.strip()
@@ -321,6 +551,8 @@ class Claude:
 
         self.session_id: str | None = None
         self.lock = threading.Lock()
+        self.pending: dict | None = None          # a speculative next turn, or None
+        self.pending_lock = threading.Lock()
 
     @property
     def inherited(self) -> str:
@@ -335,16 +567,20 @@ class Claude:
             "--append-system-prompt", system,
             "--restricted",
             "--permission-prompts", "none",
-            "--allowedTools", "Read", "Grep", "Glob",
-            "--disallowedTools", "Write", "Edit", "MultiEdit", "NotebookEdit",
-            "Bash", "WebFetch", "WebSearch", "Task",
+            "--allowedTools", "Read", "Grep", "Glob", "Write", "Edit", "MultiEdit",
+            "--disallowedTools", "NotebookEdit", "Bash", "WebFetch", "WebSearch", "Task",
         ]
+        if self.shadow:
+            argv += ["--add-dir", self.shadow]
         if self.model:
             argv += ["--model", self.model]
         if mode == "resume" and self.session_id:
             argv += ["--resume", self.session_id]
         elif mode == "fork" and self.parent:
             argv += ["--resume", self.parent, "--fork-session"]
+        elif mode == "prefetch" and self.session_id:
+            # Fork, never resume: the canonical session must not be advanced by a guess.
+            argv += ["--resume", self.session_id, "--fork-session"]
         return argv
 
     def ask(self, prompt: str, system: str, emit):
@@ -375,13 +611,83 @@ class Claude:
                     emit("notice", "Could not inherit the terminal session — starting cold.")
             emit("error", "Claude exited without an answer. Check the terminal for details.")
 
-    def _run(self, argv, emit) -> bool:
+    def prefetch(self, prompt: str, system: str, label: str) -> bool:
+        """Speculatively run the next turn on a fork of the current session.
+
+        The fork is the whole trick: the canonical session is never advanced, so a guess
+        that turns out wrong costs nothing to abandon — there is no state to roll back.
+        """
+        with self.pending_lock:
+            if not self.session_id or self.pending is not None:
+                return False
+            slot = {
+                "label": label, "text": [], "tools": [], "session": None,
+                "done": threading.Event(), "ok": False, "proc": None, "cancelled": False,
+            }
+            self.pending = slot
+
+        def run():
+            cap: dict = {}
+
+            def emit(kind, payload):
+                if kind == "delta":
+                    slot["text"].append(payload)
+                elif kind == "tool":
+                    slot["tools"].append(payload)
+
+            try:
+                ok = self._run(self._argv(prompt, system, "prefetch"), emit, capture=cap, slot=slot)
+            except (OSError, ValueError):
+                ok = False
+            slot["session"] = cap.get("session")
+            slot["ok"] = bool(ok and slot["text"] and slot["session"])
+            slot["done"].set()
+
+        threading.Thread(target=run, daemon=True).start()
+        return True
+
+    def take(self, label: str) -> dict | None:
+        """Claim the speculative turn for `label`, waiting if it is still in flight."""
+        with self.pending_lock:
+            slot = self.pending
+            if slot is None or slot["label"] != label:
+                return None
+            self.pending = None
+        if not slot["done"].wait(timeout=600):
+            slot["cancelled"] = True
+            return None
+        if slot["cancelled"] or not slot["ok"]:
+            return None
+        with self.lock:
+            self.session_id = slot["session"]      # the guess was right: adopt the fork
+        return slot
+
+    def cancel_pending(self) -> None:
+        """Abandon the speculative turn. The canonical session was never touched."""
+        with self.pending_lock:
+            slot, self.pending = self.pending, None
+        if slot is None:
+            return
+        slot["cancelled"] = True
+        proc = slot.get("proc")
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        slot["done"].set()
+
+    def _run(self, argv, emit, capture: dict | None = None, slot: dict | None = None) -> bool:
         proc = subprocess.Popen(
             argv, cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1,
         )
+        if slot is not None:
+            slot["proc"] = proc
         got_text = False
         for raw in proc.stdout:
+            if slot is not None and slot["cancelled"]:
+                return False
             raw = raw.strip()
             if not raw:
                 continue
@@ -392,7 +698,12 @@ class Claude:
             kind = ev.get("type")
 
             if ev.get("session_id"):
-                self.session_id = ev["session_id"]
+                # A speculative run parks its id in `capture`; only a committed turn
+                # is allowed to move the session the dashboard is actually on.
+                if capture is not None:
+                    capture["session"] = ev["session_id"]
+                else:
+                    self.session_id = ev["session_id"]
 
             if kind == "stream_event":
                 inner = ev.get("event", {})
@@ -484,6 +795,7 @@ class Handler(BaseHTTPRequestHandler):
     last_ping: float = 0.0
     sync_path: str | None = None
     synced_upto: int = 0
+    shadow: "Shadow" = None      # type: ignore[assignment]
     first_question: str = ""
 
     def log_message(self, fmt, *args):
@@ -538,6 +850,11 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/file":
             res = self.repo.read(self._query().get("path", ""))
             self._json(res, 200 if "error" not in res else 404)
+        elif path == "/api/proposals":
+            self._json({"items": Handler.shadow.entries(), "root": Handler.shadow.root})
+        elif path == "/api/proposal":
+            res = Handler.shadow.read(self._query().get("path", ""))
+            self._json(res, 200 if "error" not in res else 404)
         elif path == "/api/watch":
             rel = self._query().get("path", "")
             try:
@@ -569,6 +886,12 @@ class Handler(BaseHTTPRequestHandler):
             except (KeyError, TypeError, ValueError):
                 res = {"ok": False, "error": "Malformed edit."}
             self._json(res)
+        elif path == "/api/proposal/apply":
+            b = self._body()
+            self._json(self._proposal_bulk(b, Handler.shadow.apply))
+        elif path == "/api/proposal/discard":
+            b = self._body()
+            self._json(self._proposal_bulk(b, Handler.shadow.discard))
         elif path == "/api/sync":
             b = self._body()
             self._json(Handler.sync(bool(b.get("close"))))
@@ -579,15 +902,59 @@ class Handler(BaseHTTPRequestHandler):
             Handler.handback.set()
         elif path == "/api/ask":
             b = self._body()
-            self._ask(b.get("q", ""), b.get("context", ""))
+            self._ask(b.get("q", ""), b.get("context", ""), b.get("cont") or "")
+        elif path == "/api/prefetch":
+            b = self._body()
+            self._json(self._prefetch(b.get("label") or "", b.get("context", "")))
+        elif path == "/api/prefetch/cancel":
+            self.claude.cancel_pending()
+            self._json({"ok": True})
         else:
             self._send(404, "text/plain", b"not found")
 
-    def _ask(self, question: str, context: str):
+    def _proposal_bulk(self, b: dict, fn) -> dict:
+        """Run apply/discard over one path or every pending proposal."""
+        if b.get("all"):
+            paths = [e["path"] for e in Handler.shadow.entries()]
+        else:
+            paths = [str(b.get("path") or "")]
+        done, failed = [], []
+        for rel in paths:
+            res = fn(rel)
+            (done if res.get("ok") else failed).append(res.get("path") or rel)
+        return {"ok": not failed, "done": done, "failed": failed,
+                "left": len(Handler.shadow.entries())}
+
+    def _system(self) -> str:
+        return RULES.format(
+            root=self.repo.root, inherited=self.claude.inherited, brief=self.claude.brief,
+            shadow=Handler.shadow.root,
+        )
+
+    def _prefetch(self, label: str, context: str) -> dict:
+        """Start speculating on the next Continue. Returns when the guess is ready."""
+        if not label:
+            return {"ok": False}
+        prompt = (context.strip() + "\n\n" + CONTINUE_PROMPT) if context.strip() else CONTINUE_PROMPT
+        if not self.claude.prefetch(prompt, self._system(), label):
+            return {"ok": False}
+        slot = self.claude.pending
+        if slot is None:                    # already claimed or cancelled while we looked
+            return {"ok": True, "ready": True}
+        slot["done"].wait(timeout=600)
+        return {"ok": True, "ready": bool(slot["ok"]) and not slot["cancelled"]}
+
+    def _ask(self, question: str, context: str, cont: str = ""):
         question = (question or "").strip()
         if not question:
             self._json({"error": "empty"}, 400)
             return
+
+        # A Continue we already guessed at is served from the fork; anything else
+        # invalidates the guess, and abandoning it needs no rollback.
+        slot = self.claude.take(cont) if cont else None
+        if slot is None:
+            self.claude.cancel_pending()
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -595,10 +962,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
 
+        if slot is not None:
+            self._replay(question, context, slot)
+            return
+
         prompt = (context.strip() + "\n\n" + question) if context.strip() else question
-        system = RULES.format(
-            root=self.repo.root, inherited=self.claude.inherited, brief=self.claude.brief,
-        )
+        system = self._system()
         q: queue.Queue = queue.Queue()
 
         threading.Thread(
@@ -625,6 +994,22 @@ class Handler(BaseHTTPRequestHandler):
             if kind in ("done", "error"):
                 Handler.record(question, context, "".join(answer), tools)
                 return
+
+    def _replay(self, question: str, context: str, slot: dict) -> None:
+        """Deliver an already-finished turn. It lands in one piece, not at typing speed."""
+        text = "".join(slot["text"])
+        for name in slot["tools"]:
+            self._event("tool", name)
+        self._event("delta", text)
+        self._event("done", "")
+        Handler.record(question, context, text, list(slot["tools"]))
+
+    def _event(self, kind: str, payload: str) -> None:
+        try:
+            self.wfile.write(f"data: {json.dumps({'k': kind, 'v': payload})}\n\n".encode("utf-8"))
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     @classmethod
     def sync(cls, closing: bool) -> dict:
@@ -714,7 +1099,57 @@ body {
 #syncbar button.ghost { background: transparent; color: var(--fg-dim); border: 1px solid var(--border); }
 #syncbar button.ghost:hover:not(:disabled) { background: var(--bg-hover); color: #fff; }
 #syncnote { font-size: 11px; color: var(--green); margin-left: 2px; }
+/* The proposals list is the bottom half of the explorer, not an overlay: pending work
+   belongs next to the tree it will change, and must never cover the conversation. */
+#propPane {
+  flex: 0 0 auto; max-height: 45%; min-height: 0; display: flex; flex-direction: column;
+  border-top: 1px solid var(--border); background: var(--bg-side);
+}
+.ptHead { display: flex; align-items: center; gap: 6px; padding: 6px 8px;
+          border-bottom: 1px solid var(--border); font-size: 10px; letter-spacing: 0.09em;
+          text-transform: uppercase; color: var(--fg-faint); }
+.ptHead b { color: var(--hl-rail); font-weight: 700; }
+.ptHead .spacer { flex: 1; }
+.ptHead .btn { font-size: 10px; padding: 2px 7px; }
+#ptList { overflow-y: auto; flex: 1 1 auto; min-height: 0; }
+.ptRow { display: flex; align-items: center; gap: 6px; padding: 5px 8px;
+         border-bottom: 1px solid #333; font-size: 11.5px; }
+.ptRow:hover { background: var(--bg-hover); }
+.ptRow .p { flex: 1; font-family: var(--mono); font-size: 11px; color: var(--fg-dim);
+            cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+            direction: rtl; unicode-bidi: plaintext; text-align: left; }
+.ptRow .p:hover { color: #fff; }
+.ptRow .tag { font-size: 9px; letter-spacing: 0.06em; text-transform: uppercase;
+              color: var(--hl-rail); }
+.ptRow .n { font-family: var(--mono); font-size: 10px; }
+.ptRow .n .a { color: var(--green); }
+.ptRow .n .r { color: var(--red); }
+.ptRow button { font: inherit; font-size: 10px; font-family: var(--ui); border: 0;
+                border-radius: 2px; padding: 1px 6px; cursor: pointer; }
+.ptRow .ok { background: var(--btn); color: #fff; }
+.ptRow .no { background: transparent; color: var(--fg-faint); border: 1px solid var(--border); }
+.ptFoot { padding: 4px 8px; font-size: 9.5px; color: var(--fg-faint);
+          font-family: var(--mono); border-top: 1px solid var(--border);
+          overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; unicode-bidi: plaintext; }
+.tab .prop { color: var(--hl-rail); font-size: 9px; letter-spacing: 0.06em; margin-left: 4px; }
 .titlebar .center { flex: 1; text-align: center; color: var(--fg-faint); }
+#pftoggle {
+  display: flex; align-items: center; gap: 5px; font-size: 10px; letter-spacing: 0.06em;
+  text-transform: uppercase; color: var(--fg-faint); cursor: pointer; user-select: none;
+}
+#pftoggle:hover { color: var(--fg-dim); }
+#pfon { appearance: none; width: 20px; height: 11px; border-radius: 6px; background: #2d2d2d;
+        position: relative; cursor: pointer; transition: background .15s; margin: 0; }
+#pfon::after { content: ""; position: absolute; top: 2px; left: 2px; width: 7px; height: 7px;
+               border-radius: 50%; background: var(--fg-faint); transition: transform .15s, background .15s; }
+#pfon:checked { background: #2f4f36; }
+#pfon:checked::after { transform: translateX(9px); background: var(--green); }
+/* The only motion is a slow fade on a 5px dot — visible if looked for, ignorable if not. */
+#pfdot { width: 5px; height: 5px; border-radius: 50%; background: transparent; transition: background .2s; }
+#pfdot.run { background: var(--fg-faint); animation: pfpulse 1.6s ease-in-out infinite; }
+#pfdot.ready { background: var(--green); }
+@keyframes pfpulse { 0%, 100% { opacity: 0.25; } 50% { opacity: 0.9; } }
+@media (prefers-reduced-motion: reduce) { #pfdot.run { animation: none; opacity: 0.6; } }
 
 .main { flex: 1 1 auto; display: flex; min-height: 0; }
 .pane { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
@@ -808,15 +1243,32 @@ body {
 .err { color: #f44747; }
 
 /* chat */
+#logwrap { flex: 1 1 auto; position: relative; min-height: 0; display: flex; }
 #log { flex: 1 1 auto; overflow-y: auto; padding: 14px 16px 6px; }
-.msg { margin-bottom: 18px; }
+#jumpDown {
+  position: absolute; top: 8px; left: 50%; transform: translateX(-50%); z-index: 5;
+  font: inherit; font-size: 11px; font-family: var(--ui); background: var(--btn); color: #fff;
+  border: 0; border-radius: 10px; padding: 3px 11px; cursor: pointer; opacity: 0.92;
+  box-shadow: 0 1px 6px rgba(0,0,0,0.45);
+}
+#jumpDown:hover { background: var(--btn-hover); opacity: 1; }
+.msg { margin-bottom: 18px; scroll-margin-top: 0; }
+/* Grows so the last exchange can still be pulled to the top of the viewport. */
+#tailpad { height: 0; }
+.msg.cell { transition: background .35s; border-radius: 2px; }
+.msg.cell.jumped { background: #2a2f38; }
+#cellPrev, #cellNext { font-size: 13px; line-height: 1; padding: 2px 6px; }
 .who { font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--fg-faint); margin-bottom: 5px; }
 .msg.me .who { color: #569cd6; }
+.who.titled { color: var(--fg-dim); font-size: 11px; letter-spacing: 0.04em; text-transform: none;
+              font-weight: 600; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
 .msg.me .body { background: #2d2d2d; border-left: 2px solid var(--accent); padding: 7px 10px; white-space: pre-wrap; color: var(--fg-dim); font-size: 12.5px; }
 .body { line-height: 1.65; }
 .body p { margin: 0 0 0.7em; }
 .body p:last-child { margin-bottom: 0; }
 .body code { font-family: var(--mono); font-size: 12px; background: #2d2d2d; padding: 1px 4px; border-radius: 2px; color: #ce9178; }
+.body strong { font-weight: 600; color: #fff; }
+.body em { font-style: italic; color: var(--fg); }
 .chip {
   font-family: var(--mono); font-size: 11.5px; background: var(--chip-bg); color: var(--hl-rail);
   border: 1px solid #5a4a20; border-radius: 2px; padding: 1px 5px; cursor: pointer; white-space: nowrap;
@@ -841,6 +1293,12 @@ body {
 .contbar .kbd { font-family: var(--mono); font-size: 10.5px; color: var(--fg-faint); }
 .notice { color: var(--fg-faint); font-size: 12px; font-style: italic; }
 
+.snip {
+  font-family: var(--mono); font-size: 12px; line-height: 1.5; margin: 9px 0; padding: 8px 10px;
+  background: var(--bg-editor); border: 1px solid var(--border); border-left: 2px solid #6a9955;
+  border-radius: 2px; overflow-x: auto; white-space: pre; color: var(--fg-dim);
+}
+.snip.live { opacity: 0.75; }
 .diff { border: 1px solid var(--border); background: var(--bg-editor); margin: 10px 0; }
 .diff .head { display: flex; align-items: center; gap: 8px; padding: 5px 10px; background: var(--bg-side); border-bottom: 1px solid var(--border); font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--fg-faint); }
 .diff .head .spacer { flex: 1; }
@@ -894,6 +1352,9 @@ textarea:focus { outline: none; border-color: var(--accent); }
 <div class="titlebar">
   <span class="brand">codewalk</span>
   <span class="center" id="titleRoot">—</span>
+  <label id="pftoggle" title="Prefetch the next step while you read, so Continue is instant">
+    <input type="checkbox" id="pfon"><span>prefetch</span><i id="pfdot"></i>
+  </label>
   <span id="syncbar" hidden><button id="syncNow">Sync to terminal</button><button id="syncClose" class="ghost">Sync &amp; close</button></span>
   <button id="handback" hidden>Return to terminal</button>
 </div>
@@ -903,6 +1364,11 @@ textarea:focus { outline: none; border-color: var(--accent); }
     <div class="paneHead"><span id="expName">Explorer</span><span class="spacer"></span><span class="dim" id="fileCount" style="text-transform:none;letter-spacing:0"></span></div>
     <input id="filter" type="search" placeholder="Filter files…" aria-label="Filter files">
     <div id="tree"></div>
+    <div id="propPane" hidden>
+      <div class="ptHead"><span>Proposed <b id="propN">0</b></span><span class="spacer"></span><button id="ptAll" class="btn">Apply all</button><button id="ptNone" class="btn ghost">Discard</button></div>
+      <div id="ptList"></div>
+      <div class="ptFoot" id="ptFoot"></div>
+    </div>
   </section>
 
   <div class="sash" id="sash1" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize explorer"></div>
@@ -925,8 +1391,11 @@ textarea:focus { outline: none; border-color: var(--accent); }
   <div class="sash" id="sash2" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize chat"></div>
 
   <section class="pane" id="chat">
-    <div class="paneHead"><span>Walkthrough</span><span class="spacer"></span><button class="iconbtn" id="follow" title="Let Claude move the editor as it explains">Follow: on</button><button class="iconbtn" id="clearHl" disabled>Clear highlight</button></div>
-    <div id="log"></div>
+    <div class="paneHead"><span>Walkthrough</span><span class="spacer"></span><button class="iconbtn" id="follow" title="Let Claude move the editor as it explains">Follow: on</button><button class="iconbtn" id="clearHl" disabled>Clear highlight</button><button class="iconbtn" id="cellPrev" title="Previous step (Alt+Up)" disabled>&#8593;</button><button class="iconbtn" id="cellNext" title="Next step (Alt+Down)" disabled>&#8595;</button></div>
+    <div id="logwrap">
+      <button id="jumpDown" hidden title="Jump to the latest step">&#8595; latest</button>
+      <div id="log"><div id="tailpad"></div></div>
+    </div>
     <div id="composer">
       <div id="ctx" hidden></div>
       <div class="refbar" id="refs" hidden></div>
@@ -1099,10 +1568,13 @@ textarea:focus { outline: none; border-color: var(--accent); }
 
   async function openFile(path, spec, focus) {
     let t = tab(path);
+    const isProp = path.startsWith(PROP);
     if (!t) {
-      const data = await fetch("/api/file?path=" + encodeURIComponent(path)).then((r) => r.json());
+      const rel = isProp ? path.slice(PROP.length) : path;
+      const url = (isProp ? "/api/proposal?path=" : "/api/file?path=") + encodeURIComponent(rel);
+      const data = await fetch(url).then((r) => r.json());
       if (data.error) { flash(data.error); return null; }
-      t = { path: path, data: data, hl: new Set(), sel: null, scroll: 0 };
+      t = { path: path, data: data, hl: new Set(), sel: null, scroll: 0, prop: isProp };
       openTabs.push(t);
     }
     if (active && active !== path) {
@@ -1111,11 +1583,16 @@ textarea:focus { outline: none; border-color: var(--accent); }
     }
     active = path;
     if (spec) { t.hl = parseSpec(spec); }
-    expandTo(path);
-    renderTree();
+    // Opening a proposal rails exactly the lines that differ from the repo.
+    else if (isProp && t.data.changed && !t.hl.size) t.hl = new Set(t.data.changed);
+    // A proposal has no place in the repo tree and nothing to watch on disk.
+    if (!isProp) {
+      expandTo(path);
+      renderTree();
+    }
     renderTabs();
     renderCode(t, !!spec);
-    watchFile(t);
+    if (!isProp) watchFile(t);
     pushHist(path, spec);
     return t;
   }
@@ -1144,6 +1621,12 @@ textarea:focus { outline: none; border-color: var(--accent); }
       dot.style.width = "6px"; dot.style.height = "6px"; dot.style.borderRadius = "50%"; dot.style.display = "inline-block";
       const n = document.createElement("span");
       n.textContent = t.data.name;
+      if (t.prop) {
+        const pr = document.createElement("span");
+        pr.className = "prop";
+        pr.textContent = t.data.new ? "NEW" : "PROPOSED";
+        n.appendChild(pr);
+      }
       const x = document.createElement("span");
       x.className = "x"; x.textContent = "×";
       x.onclick = (e) => { e.stopPropagation(); closeTab(t.path); };
@@ -1402,10 +1885,11 @@ textarea:focus { outline: none; border-color: var(--accent); }
   const OPEN_RE = /\[\[open:\s*([^\]|:]+?)\s*(?::\s*([\d,\s-]+?))?\s*(?:\|\s*([^\]]*?)\s*)?\]\]/g;
   const EDIT_RE = /\[\[edit:\s*([^\]|:]+?)\s*:\s*(\d+)\s*-\s*(\d+)\s*\]\]\n?([\s\S]*?)\[\[\/edit\]\]/g;
   const CONT_RE = /\[\[continue(?::\s*([^\]]*?))?\s*\]\]/;
+  const TITLE_RE = /\[\[title:\s*([^\]]*?)\s*\]\]/;
 
   function renderReply(el, text) {
     el.textContent = "";
-    text = text.replace(CONT_RE, "");   // the marker is a control signal, not prose
+    text = text.replace(CONT_RE, "").replace(TITLE_RE, "");   // control signals, not prose
     let cursor = 0, m;
     EDIT_RE.lastIndex = 0;
     while ((m = EDIT_RE.exec(text))) {
@@ -1423,7 +1907,39 @@ textarea:focus { outline: none; border-color: var(--accent); }
     } else prose(el, tail);
   }
 
+  // A fenced block is code that is NOT in the repo yet — a proposal, a sketch, an
+  // alternative. Code that IS in the repo belongs in the center pane via [[open:]].
+  const FENCE_RE = /```[\w.+-]*\n?([\s\S]*?)```/g;
+
+  function snippet(code, live) {
+    const pre = document.createElement("pre");
+    pre.className = "snip" + (live ? " live" : "");
+    pre.textContent = code.replace(/\n$/, "");
+    return pre;
+  }
+
   function prose(el, text) {
+    if (!text.trim()) return;
+    let last = 0, m;
+    FENCE_RE.lastIndex = 0;
+    while ((m = FENCE_RE.exec(text))) {
+      paras(el, text.slice(last, m.index));
+      el.appendChild(snippet(m[1], false));
+      last = m.index + m[0].length;
+    }
+    const tail = text.slice(last);
+    // A fence still being written: show it as a block immediately rather than as
+    // paragraphs full of backticks that reflow the moment it closes.
+    const openFence = tail.search(/```[\w.+-]*\n/);
+    if (openFence !== -1) {
+      paras(el, tail.slice(0, openFence));
+      el.appendChild(snippet(tail.slice(openFence).replace(/^```[\w.+-]*\n?/, ""), true));
+    } else {
+      paras(el, tail);
+    }
+  }
+
+  function paras(el, text) {
     if (!text.trim()) return;
     for (const para of text.split(/\n{2,}/)) {
       if (!para.trim()) continue;
@@ -1444,13 +1960,35 @@ textarea:focus { outline: none; border-color: var(--accent); }
     }
   }
 
+  // Bold and italic. Underscore forms are deliberately NOT supported: identifiers
+  // like input_patch_len appear constantly in this prose and would false-italicize.
+  const EMPH_RE = /(\*\*[^*\n]+\*\*|\*[^*\n]+\*)/;
+
+  function emitText(p, text) {
+    if (!text) return;
+    for (const bit of text.split(EMPH_RE)) {
+      if (!bit) continue;
+      if (bit.length > 4 && bit.startsWith("**") && bit.endsWith("**")) {
+        const b = document.createElement("strong");
+        b.textContent = bit.slice(2, -2);
+        p.appendChild(b);
+      } else if (bit.length > 2 && bit.startsWith("*") && bit.endsWith("*")) {
+        const i = document.createElement("em");
+        i.textContent = bit.slice(1, -1);
+        p.appendChild(i);
+      } else {
+        p.appendChild(document.createTextNode(bit));
+      }
+    }
+  }
+
   function scanDirectives(p, text) {
     let last = 0, m;
     OPEN_RE.lastIndex = 0;
     while ((m = OPEN_RE.exec(text))) {
       const path = m[1], spec = m[2] || "", label = m[3];
       if (!isPath(path)) continue;
-      p.appendChild(document.createTextNode(text.slice(last, m.index)));
+      emitText(p, text.slice(last, m.index));
       const chip = document.createElement("button");
       chip.className = "chip";
       chip.textContent = label ? label + " \u00b7 " + shortPath(path) + (spec ? ":" + spec : "")
@@ -1464,7 +2002,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
       p.appendChild(chip);
       last = m.index + m[0].length;
     }
-    p.appendChild(document.createTextNode(text.slice(last)));
+    emitText(p, text.slice(last));
   }
 
   // A real path has word characters and no whitespace — this rejects the literal
@@ -1582,9 +2120,234 @@ textarea:focus { outline: none; border-color: var(--accent); }
     const b = document.createElement("div");
     b.className = "body";
     m.append(w, b);
-    logEl.appendChild(m);
-    logEl.scrollTop = logEl.scrollHeight;
+    logEl.insertBefore(m, $("tailpad"));
     return m;
+  }
+
+  // ---------------- proposals ----------------
+  // Files the agent drafted in the shadow tree. They are real files on disk, but outside
+  // the repo, so nothing the user is reading changes until they say so here.
+  const PROP = "@proposed/";
+  let propItems = [];
+
+  async function refreshProposals() {
+    let d = null;
+    try { d = await fetch("/api/proposals").then((r) => r.json()); } catch (e) { return; }
+    propItems = d.items || [];
+    // The section simply is not there when nothing is pending — no empty state to ignore.
+    $("propPane").hidden = propItems.length === 0;
+    $("propN").textContent = propItems.length;
+    $("ptFoot").textContent = d.root || "";
+    renderProposals();
+  }
+
+  function renderProposals() {
+    const list = $("ptList");
+    list.textContent = "";
+    for (const it of propItems) {
+      const row = document.createElement("div");
+      row.className = "ptRow";
+
+      const p = document.createElement("span");
+      p.className = "p";
+      p.textContent = it.path;
+      p.title = "Open this proposal in the editor";
+      p.onclick = () => openFile(PROP + it.path);
+
+      const tag = document.createElement("span");
+      tag.className = "tag";
+      tag.textContent = it.new ? "new" : (it.same ? "identical" : "changed");
+
+      const n = document.createElement("span");
+      n.className = "n";
+      if (!it.new) {
+        const a = document.createElement("span"); a.className = "a"; a.textContent = "+" + it.added;
+        const r = document.createElement("span"); r.className = "r"; r.textContent = " -" + it.removed;
+        n.append(a, r);
+      }
+
+      const ok = document.createElement("button");
+      ok.className = "ok"; ok.textContent = "Apply";
+      ok.onclick = () => propAct("/api/proposal/apply", { path: it.path });
+
+      const no = document.createElement("button");
+      no.className = "no"; no.textContent = "Discard";
+      no.onclick = () => propAct("/api/proposal/discard", { path: it.path });
+
+      row.append(p, tag, n, ok, no);
+      list.appendChild(row);
+    }
+  }
+
+  async function propAct(url, body) {
+    let res = null;
+    try {
+      res = await fetch(url, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }).then((r) => r.json());
+    } catch (e) { flash("Could not reach the server."); return; }
+    if (res && res.failed && res.failed.length) flash("Failed: " + res.failed.join(", "));
+    // Applied files change the repo underneath any tab showing them.
+    for (const t of openTabs.slice()) {
+      if (t.path.startsWith(PROP)) closeTab(t.path);
+    }
+    for (const t of openTabs.slice()) {
+      if ((res.done || []).includes(t.path)) { closeTab(t.path); openFile(t.path); }
+    }
+    refreshProposals();
+  }
+
+  function setupProposals() {
+    $("ptAll").onclick = () => propAct("/api/proposal/apply", { all: true });
+    $("ptNone").onclick = () => propAct("/api/proposal/discard", { all: true });
+    refreshProposals();
+  }
+
+  // ---------------- cells ----------------
+  // Each exchange is a cell. A new answer is pinned near the TOP of the viewport, not the
+  // bottom, so reading starts immediately and the text fills in below rather than pushing
+  // the eye down the page. TOP_FRAC of the pane is left above it so the question stays visible.
+  const TOP_FRAC = 0.18;
+
+  function cells() { return Array.from(logEl.querySelectorAll(".msg.cell")); }
+
+  // The last cell can only be pulled up if there is something under it to scroll into.
+  function sizePad() {
+    const c = cells();
+    const last = c[c.length - 1];
+    const pad = $("tailpad");
+    if (!last) { pad.style.height = "0px"; return; }
+    const room = logEl.clientHeight * (1 - TOP_FRAC) - last.offsetHeight;
+    pad.style.height = Math.max(0, room) + "px";
+  }
+
+  // The pin is HELD, not applied once: an answer that is still being written (or has not
+  // started arriving yet) changes height constantly, and a single scrollTop assignment at
+  // the wrong moment silently clamps. Re-asserting on every frame of growth is what makes
+  // "click Continue while it is still thinking" land in the right place.
+  let pinTarget = null, pinHeld = false, cellIdx = -1;
+
+  function holdPin(msg) {
+    pinTarget = msg;
+    pinHeld = true;
+    applyPin();
+  }
+
+  function applyPin() {
+    if (!pinHeld || !pinTarget || !pinTarget.isConnected) return;
+    sizePad();
+    const delta = pinTarget.getBoundingClientRect().top - logEl.getBoundingClientRect().top;
+    logEl.scrollTop += delta - logEl.clientHeight * TOP_FRAC;
+  }
+
+  function releasePin() { pinHeld = false; }
+
+  function atLatest() {
+    const c = cells();
+    if (!c.length) return true;
+    const last = c[c.length - 1];
+    const top = last.getBoundingClientRect().top - logEl.getBoundingClientRect().top;
+    return top < logEl.clientHeight * 0.75;
+  }
+
+  function updateJump() {
+    $("jumpDown").hidden = atLatest();
+  }
+
+  function gotoCell(i) {
+    const c = cells();
+    if (!c.length) return;
+    cellIdx = Math.max(0, Math.min(c.length - 1, i));
+    const m = c[cellIdx];
+    holdPin(m);
+    releasePin();                 // a deliberate jump is a destination, not a follow
+    m.classList.add("jumped");
+    setTimeout(() => m.classList.remove("jumped"), 400);
+    syncCellNav();
+    updateJump();
+  }
+
+  function syncCellNav() {
+    const n = cells().length;
+    $("cellPrev").disabled = !(n && cellIdx > 0);
+    $("cellNext").disabled = !(n && cellIdx < n - 1);
+  }
+
+  function setupCells() {
+    $("cellPrev").onclick = () => gotoCell(cellIdx - 1);
+    $("cellNext").onclick = () => gotoCell(cellIdx + 1);
+    $("jumpDown").onclick = () => gotoCell(cells().length - 1);
+    // Only real input releases the pin — never our own scrollTop writes.
+    for (const ev of ["wheel", "touchmove", "mousedown"]) {
+      logEl.addEventListener(ev, releasePin, { passive: true });
+    }
+    logEl.addEventListener("scroll", updateJump, { passive: true });
+    window.addEventListener("keydown", (e) => {
+      if (e.altKey && !e.ctrlKey && !e.metaKey) {
+        if (e.key === "ArrowUp") { e.preventDefault(); gotoCell(cellIdx - 1); return; }
+        if (e.key === "ArrowDown") { e.preventDefault(); gotoCell(cellIdx + 1); return; }
+      }
+      if (document.activeElement === logEl && /^(Arrow|Page|Home|End)/.test(e.key)) releasePin();
+    });
+    window.addEventListener("resize", () => { sizePad(); applyPin(); updateJump(); });
+    syncCellNav();
+    updateJump();
+  }
+
+  // ---------------- prefetch ----------------
+  // Speculate on the next Continue while the user reads. The server runs it on a fork,
+  // so if they type something else instead the guess is simply dropped — there is no
+  // state to unwind, and the user is never told any of this happened.
+  let pfOn = false, pfLabel = null, pfReady = false;
+
+  function viewContext() {
+    const t = tab(active);
+    if (!t) return "";
+    let c = "[The user is looking at " + t.path;
+    if (t.sel) c += ", lines " + t.sel.a + "-" + t.sel.b + " selected";
+    return c + ".]";
+  }
+
+  function pfDot(state) {
+    const d = $("pfdot");
+    d.className = state || "";
+  }
+
+  function pfCancel() {
+    pfLabel = null; pfReady = false; pfDot("");
+    fetch("/api/prefetch/cancel", { method: "POST" }).catch(() => {});
+  }
+
+  async function pfStart(label, context) {
+    if (!pfOn || !label) return;
+    pfLabel = label; pfReady = false; pfDot("run");
+    let res = null;
+    try {
+      res = await fetch("/api/prefetch", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ label: label, context: context }),
+      }).then((r) => r.json());
+    } catch (e) { res = null; }
+    if (pfLabel !== label) return;              // superseded while in flight
+    pfReady = !!(res && res.ok && res.ready);
+    pfDot(pfReady ? "ready" : "");
+  }
+
+  function setupPrefetch() {
+    const box = $("pfon");
+    try { pfOn = localStorage.getItem("codewalk.prefetch") === "1"; } catch (e) { pfOn = false; }
+    box.checked = pfOn;
+    box.onchange = () => {
+      pfOn = box.checked;
+      try { localStorage.setItem("codewalk.prefetch", pfOn ? "1" : "0"); } catch (e) {}
+      if (!pfOn) pfCancel();
+      else {
+        // Turned on mid-tour: speculate on the Continue already on screen.
+        const btn = logEl.querySelector(".contbar .contbtn");
+        if (btn && btn.dataset.label !== undefined && !busy) pfStart(btn.dataset.label, viewContext());
+      }
+    };
   }
 
   // A step ends with [[continue: ...]]; this is the button that asks for the next one.
@@ -1602,13 +2365,24 @@ textarea:focus { outline: none; border-color: var(--accent); }
       nx.textContent = "\u2192 " + label;
       btn.appendChild(nx);
     }
-    btn.onclick = () => ask("Continue.");
+    btn.dataset.label = label || "";
+    btn.onclick = () => ask("Continue.", label || "");
     const hint = document.createElement("span");
     hint.className = "kbd";
     hint.textContent = "or press Enter";
     bar.append(btn, hint);
     msg.appendChild(bar);
-    logEl.scrollTop = logEl.scrollHeight;
+    sizePad();      // the button is part of the cell; never yank the view to it
+    applyPin();
+  }
+
+  // The "who" label doubles as the cell heading once a title arrives.
+  function setCellTitle(msg, title) {
+    if (!title || msg.dataset.title === title) return;
+    msg.dataset.title = title;
+    const w = msg.querySelector(".who");
+    w.textContent = title;
+    w.classList.add("titled");
   }
 
   function retireContinues() {
@@ -1626,10 +2400,15 @@ textarea:focus { outline: none; border-color: var(--accent); }
     $("stState").textContent = label || (on ? "thinking" : "ready");
   }
 
-  async function ask(text) {
+  async function ask(text, cont) {
     if (busy) return;
     const q = (text || "").trim();
     if (!q) return;
+
+    // Claim the guess only if it is for this exact step; otherwise drop it.
+    const claim = (cont && pfLabel === cont) ? cont : "";
+    if (!claim) pfCancel(); else pfDot("");
+    pfLabel = null; pfReady = false;
 
     retireContinues();
     const t = tab(active);
@@ -1662,20 +2441,24 @@ textarea:focus { outline: none; border-color: var(--accent); }
     refs = [];
     renderRefs();
     const msg = bubble("Claude");
+    msg.classList.add("cell");
     const acts = document.createElement("div");
     acts.className = "acts";
     const out = msg.querySelector(".body");
     msg.insertBefore(acts, out);
     out.innerHTML = '<p class="thinking">Thinking</p>';
     setBusy(true);
+    cellIdx = cells().length - 1;
+    holdPin(msg);
+    syncCellNav();
+    updateJump();
 
-    let acc = "", autoIdx = -1;
-    const atBottom = () => logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 90;
+    let acc = "", autoIdx = -1, nextPrefetch = null;
 
     try {
       const res = await fetch("/api/ask", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ q: q, context: context }),
+        body: JSON.stringify({ q: q, context: context, cont: claim }),
       });
       const reader = res.body.getReader();
       const dec = new TextDecoder();
@@ -1690,9 +2473,10 @@ textarea:focus { outline: none; border-color: var(--accent); }
           if (!part.startsWith("data: ")) continue;
           let ev;
           try { ev = JSON.parse(part.slice(6)); } catch (e) { continue; }
-          const stick = atBottom();
           if (ev.k === "delta") {
             acc += ev.v;
+            const tm = TITLE_RE.exec(acc);
+            if (tm) setCellTitle(msg, (tm[1] || "").trim());
             renderReply(out, acc);
             const ds = allDirectives(acc);
             if (follow && ds.length - 1 > autoIdx) {
@@ -1715,13 +2499,20 @@ textarea:focus { outline: none; border-color: var(--accent); }
             e.className = "errline"; e.textContent = ev.v;
             out.appendChild(e);
           }
-          if (stick) logEl.scrollTop = logEl.scrollHeight;
+          applyPin();  // the answer is growing; keep its top where the eye already is
+          updateJump();
         }
       }
       if (acc) {
+        const tm = TITLE_RE.exec(acc);
+        if (tm) setCellTitle(msg, (tm[1] || "").trim());
         renderReply(out, acc);
         const cont = CONT_RE.exec(acc);
-        if (cont) addContinue(msg, (cont[1] || "").trim());
+        if (cont) {
+          const label = (cont[1] || "").trim();
+          addContinue(msg, label);
+          nextPrefetch = label;
+        }
         const ds = allDirectives(acc);
         if (ds.length && autoIdx < 0) {
           autoIdx = 0;
@@ -1736,7 +2527,14 @@ textarea:focus { outline: none; border-color: var(--accent); }
       out.appendChild(e);
     } finally {
       setBusy(false);
-      logEl.scrollTop = logEl.scrollHeight;
+      applyPin();
+      releasePin();
+      syncCellNav();
+      updateJump();
+      // Start guessing only once this turn is fully done, so the speculative fork
+      // inherits a complete session rather than a half-written one.
+      if (nextPrefetch !== null) pfStart(nextPrefetch, viewContext());
+      refreshProposals();   // the agent may have drafted a file this turn
     }
   }
 
@@ -1857,6 +2655,9 @@ textarea:focus { outline: none; border-color: var(--accent); }
       };
     }
     if (d.handoff) setInterval(() => { fetch("/api/ping").catch(() => {}); }, 3000);
+    setupCells();
+    setupProposals();
+    setupPrefetch();
     if (d.sync) setupSync();
     renderTree();
     const b = bubble("Claude").querySelector(".body");
@@ -1912,6 +2713,9 @@ def main():
                          "session to pick up. Works with or without --handoff.")
     ap.add_argument("--idle-exit", type=int, default=15, metavar="SECONDS",
                     help="with --handoff, return to the terminal this long after the tab is closed")
+    ap.add_argument("--shadow", default=None, metavar="DIR",
+                    help="where proposed files are drafted before you agree to them "
+                         "(default: ~/.cache/codewalk/shadow/<repo>-<hash>)")
     ap.add_argument("--no-open", action="store_true")
     args = ap.parse_args()
     if args.handoff and not args.resume:
@@ -1939,7 +2743,10 @@ def main():
     Handler.first_question = args.start
     Handler.sync_path = os.path.abspath(args.sync_file) if args.sync_file else None
     Handler.repo = Repo(args.root)
-    Handler.claude = Claude(args.model, Handler.repo.root, parent, brief)
+    Handler.shadow = Shadow(args.shadow or default_shadow(Handler.repo.root), Handler.repo)
+    Handler.claude = Claude(
+        args.model, Handler.repo.root, parent, brief, shadow=Handler.shadow.root,
+    )
     n = len(Handler.repo.files())
 
     httpd = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
