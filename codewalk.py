@@ -2154,18 +2154,12 @@ textarea:focus { outline: none; border-color: var(--accent); }
     for (const para of text.split(/\n{2,}/)) {
       if (!para.trim()) continue;
       const p = document.createElement("p");
-      // Inline code is resolved FIRST: a directive written inside backticks is Claude
-      // talking about the syntax, not asking to navigate. Only bare text gets scanned.
-      for (const bit of para.split(/(`[^`\n]+`)/)) {
-        if (!bit) continue;
-        if (bit.length > 2 && bit.startsWith("`") && bit.endsWith("`")) {
-          const c = document.createElement("code");
-          c.textContent = bit.slice(1, -1);
-          p.appendChild(c);
-        } else {
-          scanDirectives(p, bit);
-        }
-      }
+      // Directives are resolved FIRST, because a label may itself contain backticks
+      // -- [[open:path|`thing`]] is normal for Claude to write, and splitting on inline
+      // code before matching would tear the directive in half and print it raw. A
+      // directive that is entirely wrapped in backticks is still just quoted syntax,
+      // and scanDirectives leaves it as code.
+      scanDirectives(p, para);
       el.appendChild(p);
     }
   }
@@ -2192,13 +2186,40 @@ textarea:focus { outline: none; border-color: var(--accent); }
     }
   }
 
+  // Inline code and emphasis, for the stretches between directives.
+  function codeAndEmph(p, text) {
+    if (!text) return;
+    for (const bit of text.split(/(`[^`\n]+`)/)) {
+      if (!bit) continue;
+      if (bit.length > 2 && bit.startsWith("`") && bit.endsWith("`")) {
+        const c = document.createElement("code");
+        c.textContent = bit.slice(1, -1);
+        p.appendChild(c);
+      } else emitText(p, bit);
+    }
+  }
+
+  // Inline-code spans, the one place both the renderer and the narrator agree on
+  // what counts as a directive: one that sits INSIDE a span is quoted syntax, one that
+  // merely CONTAINS a span in its label is a real directive.
+  function codeSpans(text) {
+    const spans = [];
+    const re = /`[^`\n]+`/g;
+    let m;
+    while ((m = re.exec(text))) spans.push([m.index, m.index + m[0].length]);
+    return spans;
+  }
+
   function scanDirectives(p, text) {
+    const spans = codeSpans(text);
     let last = 0, m;
     OPEN_RE.lastIndex = 0;
     while ((m = OPEN_RE.exec(text))) {
-      const path = m[1], spec = m[2] || "", label = m[3];
+      const path = m[1], spec = m[2] || "", label = (m[3] || "").replace(/`/g, "");
       if (!isPath(path)) continue;
-      emitText(p, text.slice(last, m.index));
+      // Quoted syntax: left where it is, and rendered as the code it is.
+      if (spans.some(([a, b]) => m.index >= a && m.index + m[0].length <= b)) continue;
+      codeAndEmph(p, text.slice(last, m.index));
       const chip = document.createElement("button");
       chip.className = "chip";
       chip.textContent = label ? label + " \u00b7 " + shortPath(path) + (spec ? ":" + spec : "")
@@ -2212,7 +2233,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
       p.appendChild(chip);
       last = m.index + m[0].length;
     }
-    emitText(p, text.slice(last));
+    codeAndEmph(p, text.slice(last));
   }
 
   // A real path has word characters and no whitespace — this rejects the literal
@@ -2801,7 +2822,18 @@ textarea:focus { outline: none; border-color: var(--accent); }
     let end = 0, m;
     UNIT_END.lastIndex = 0;
     while ((m = UNIT_END.exec(head))) end = UNIT_END.lastIndex;
-    return head.slice(0, end);
+    let stable = head.slice(0, end);
+    // Never end a pass on a directive. Its label is spoken with the words that follow,
+    // so a cut between them makes the label a chunk of its own in this pass and part of
+    // the next chunk in the following one -- the count does not grow, and the sentence
+    // after the directive is never spoken. A directive alone on its own line, which is
+    // how a step usually points at the code it is about to discuss, hits this every time.
+    const trimmed = stable.replace(/\s+$/, "");
+    if (trimmed.endsWith("]]")) {
+      const open = trimmed.lastIndexOf("[[");
+      if (open !== -1) stable = stable.slice(0, open);
+    }
+    return stable;
   }
 
   const NARR_DROP = /\[\[[^\]]*\]\]/g;

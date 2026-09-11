@@ -71,3 +71,19 @@ added to break. And the demo script you are reading right now is the only test â
 no test suite in this repo at all.
 
 [[continue: anything you want to poke at]]
+
+=== the shapes that used to break narration
+The file list comes from git when git will answer [[open:codewalk.py:91-120|`Repo.files`]],
+and falls back to walking the tree when it will not: a label written in backticks, which
+Claude does constantly, used to tear the directive in half and print it raw in the chat.
+
+The other shape is a directive standing alone on its own line, which is how a step points
+at the code it is about to discuss:
+
+[[open:codewalk.py:169-195|Repo.apply, the guarded write]]
+
+Everything after such a line used to go unspoken, because the label was a chunk by itself
+in one streaming pass and part of the next chunk in the pass after it. Writing the syntax
+as `[[open:codewalk.py:1-5]]` inside backticks stays quoted: it is code, not a chip.
+
+[[continue: whatever you want to poke at]]
