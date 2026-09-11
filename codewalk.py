@@ -192,12 +192,16 @@ class Repo:
         }
 
 
+def cache_root() -> str:
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    return os.path.join(base, "codewalk")
+
+
 def default_shadow(root: str) -> str:
     """Outside the repo on purpose: the file tree comes from `git ls-files`, so a shadow
     inside the root would either pollute the tree or be invisible to it."""
-    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
     tag = hashlib.sha256(os.path.abspath(root).encode("utf-8")).hexdigest()[:8]
-    return os.path.join(base, "codewalk", "shadow", f"{os.path.basename(root.rstrip(os.sep))}-{tag}")
+    return os.path.join(cache_root(), "shadow", f"{os.path.basename(root.rstrip(os.sep))}-{tag}")
 
 
 class Shadow:
@@ -533,6 +537,52 @@ def find_session(spec: str, context_dir: str) -> str | None:
 MODELS = ["opus", "sonnet", "haiku"]
 
 
+class Script:
+    """A canned stand-in for Claude, so the page can be worked on without a model call.
+
+    Duck-types the parts of Claude the handler touches. Answers come from a file of
+    turns separated by "=== " lines and are served in order, the last one repeating;
+    they stream out word by word because anything that looks at partial text -- the
+    narration, the pane following, the live diff cards -- only misbehaves mid-stream.
+    """
+
+    def __init__(self, path: str, model: str = "demo"):
+        self.model = model
+        self.brief = ""
+        self.pending = None
+        self.i = 0
+        self.lock = threading.Lock()
+        with open(path, encoding="utf-8") as fh:
+            body = fh.read()
+        body = re.sub(r"\A(?:#[^\n]*\n|\s*\n)+", "", body)     # strip the file header
+        turns = [t.strip() for t in re.split(r"^===[^\n]*\n", body, flags=re.M)]
+        self.turns = [t for t in turns if t] or ["Nothing in the demo script."]
+
+    @property
+    def inherited(self) -> str:
+        return ""
+
+    def ask(self, prompt: str, system: str, emit):
+        with self.lock:
+            text = self.turns[min(self.i, len(self.turns) - 1)]
+            self.i += 1
+        emit("tool", "Read  demo-walkthrough.md")
+        time.sleep(0.4)
+        for word in re.findall(r"\S+\s*", text):
+            emit("delta", word)
+            time.sleep(0.035)
+        emit("done", "")
+
+    def prefetch(self, prompt: str, system: str, label: str) -> bool:
+        return False          # nothing to speculate on: the next answer is already written
+
+    def take(self, label: str):
+        return None
+
+    def cancel_pending(self) -> None:
+        pass
+
+
 class Claude:
     """One `claude -p` session over the repo, resumed across turns.
 
@@ -785,6 +835,125 @@ def short(path: str) -> str:
 
 
 # ----------------------------------------------------------------------------------
+# voice
+# ----------------------------------------------------------------------------------
+
+PIPER_DIRS = ["~/.local/share/piper/piper", "~/.local/share/piper"]
+
+
+def find_piper() -> tuple[str, str]:
+    """(executable, model) for a local Piper install, or ("", "")."""
+    exe = os.environ.get("CODEWALK_PIPER") or ""
+    if not exe:
+        for d in PIPER_DIRS:
+            cand = os.path.join(os.path.expanduser(d), "piper")
+            if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                exe = cand
+                break
+        else:
+            exe = shutil.which("piper") or ""
+    if not exe:
+        return "", ""
+    model = os.environ.get("CODEWALK_PIPER_MODEL") or ""
+    if not model:
+        # Prefer a high-quality voice, then whatever is there, so an install with
+        # several models does not depend on directory order.
+        here = os.path.dirname(os.path.abspath(exe))
+        onnx = sorted(glob.glob(os.path.join(here, "*.onnx")))
+        if not onnx:
+            return "", ""
+        model = next((m for m in onnx if "-high" in m), onnx[0])
+    return (exe, model) if os.path.isfile(model) else ("", "")
+
+
+class Voice:
+    """Piper, kept warm.
+
+    Loading the model costs half a second, which is audible between every sentence, so
+    each speaking rate gets a resident process fed line-delimited JSON. Piper writes the
+    finished wav's path back on stdout, which is the completion signal. Rate cannot be
+    set per line, hence one process per rate rather than one process.
+    """
+
+    MAX_PROCS = 3
+
+    def __init__(self, exe: str, model: str):
+        self.exe, self.model = exe, model
+        self.procs: dict[float, dict] = {}
+        self.lock = threading.Lock()
+        self.dir = os.path.join(cache_root(), "tts")
+        os.makedirs(self.dir, exist_ok=True)
+
+    @property
+    def available(self) -> bool:
+        return bool(self.exe and self.model)
+
+    def _proc(self, scale: float) -> dict:
+        p = self.procs.get(scale)
+        if p and p["proc"].poll() is None:
+            p["used"] = time.time()
+            return p
+        if len(self.procs) >= self.MAX_PROCS:
+            old = min(self.procs, key=lambda k: self.procs[k]["used"])
+            self._kill(old)
+        proc = subprocess.Popen(
+            [self.exe, "--model", self.model, "--json-input", "--quiet",
+             "--length_scale", f"{scale:.3f}", "--sentence_silence", "0.1"],
+            cwd=self.dir, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, bufsize=1,
+        )
+        p = {"proc": proc, "lock": threading.Lock(), "used": time.time()}
+        self.procs[scale] = p
+        return p
+
+    def _kill(self, scale: float) -> None:
+        p = self.procs.pop(scale, None)
+        if not p:
+            return
+        try:
+            p["proc"].stdin.close()
+            p["proc"].terminate()
+        except Exception:
+            pass
+
+    def say(self, text: str, rate: float) -> bytes:
+        """Synthesize one chunk. Returns wav bytes, or b'' if Piper failed."""
+        text = " ".join(text.split())
+        if not text:
+            return b""
+        scale = round(min(2.0, max(0.4, 1.0 / max(0.3, rate))), 3)
+        for attempt in (1, 2):                 # a dead process is respawned once
+            with self.lock:
+                p = self._proc(scale)
+            out = os.path.join(self.dir, f"cw{os.getpid()}-{threading.get_ident()}.wav")
+            try:
+                with p["lock"]:
+                    p["proc"].stdin.write(json.dumps({"text": text, "output_file": out}) + "\n")
+                    p["proc"].stdin.flush()
+                    line = p["proc"].stdout.readline()
+                if not line:
+                    raise OSError("piper closed")
+                with open(out, "rb") as fh:
+                    data = fh.read()
+                return data
+            except Exception:
+                with self.lock:
+                    self._kill(scale)
+                if attempt == 2:
+                    return b""
+            finally:
+                try:
+                    os.unlink(out)
+                except OSError:
+                    pass
+        return b""
+
+    def shutdown(self) -> None:
+        with self.lock:
+            for scale in list(self.procs):
+                self._kill(scale)
+
+# ----------------------------------------------------------------------------------
 # http
 # ----------------------------------------------------------------------------------
 
@@ -803,6 +972,7 @@ class Handler(BaseHTTPRequestHandler):
     shadow: "Shadow" = None      # type: ignore[assignment]
     first_question: str = ""
     models: list = []
+    voice: "Voice" = None      # type: ignore[assignment]
 
     def log_message(self, fmt, *args):
         pass
@@ -851,6 +1021,7 @@ class Handler(BaseHTTPRequestHandler):
                 "handoff": Handler.handoff,
                 "first_question": Handler.first_question,
                 "sync": bool(Handler.sync_path),
+                "tts": Handler.voice.available,
                 "model": self.claude.model,
                 "models": Handler.models,
                 "files": self.repo.files(),
@@ -914,6 +1085,17 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/prefetch":
             b = self._body()
             self._json(self._prefetch(b.get("label") or "", b.get("context", "")))
+        elif path == "/api/tts":
+            b = self._body()
+            try:
+                rate = float(b.get("rate") or 1.0)
+            except (TypeError, ValueError):
+                rate = 1.0
+            wav = Handler.voice.say(str(b.get("text") or ""), rate)
+            if not wav:
+                self._json({"ok": False, "error": "tts failed"}, 503)
+                return
+            self._send(200, "audio/wav", wav)
         elif path == "/api/model":
             b = self._body()
             want = str(b.get("model") or "")
@@ -2432,7 +2614,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
   // an [[open:...]] fires the moment speech reaches the spot in the sentence where it
   // was written, which is how a person points at code while talking about it.
   const synth = window.speechSynthesis || null;
-  let narrOn = synth && localStorage.getItem("cw.voice") === "1";
+  let narrOn = localStorage.getItem("cw.voice") === "1";
   let narrRate = Number(localStorage.getItem("cw.rate") || 1.05);
   let narrVoice = null;
   let narrQ = [];          // queued {say, fire, idx, scope}
@@ -2458,37 +2640,96 @@ textarea:focus { outline: none; border-color: var(--accent); }
   }
   if (synth) { pickVoice(); synth.onvoiceschanged = pickVoice; }
 
+  // Two engines. When the server has Piper, sentences are synthesized server-side and
+  // played as audio, and the NEXT ones are synthesized while the current one plays --
+  // that lookahead is what removes the silence between sentences. Without Piper it
+  // falls back to the browser's own speechSynthesis, which cannot be run ahead.
+  let ttsOK = false;
+  const audioEl = new Audio();
+  const AHEAD = 3;
+
+  function narrDrop(it) {
+    if (it.ctrl) { try { it.ctrl.abort(); } catch (e) {} }
+    if (it.url) { URL.revokeObjectURL(it.url); it.url = null; }
+    it.ctrl = null; it.wav = null;
+  }
+
   function narrStop() {
     narrToken++;
+    for (const it of narrQ) narrDrop(it);
+    if (narrCurrent) narrDrop(narrCurrent);
     narrQ = [];
     narrBusy = false;
     narrCurrent = null;
+    audioEl.pause();
+    audioEl.removeAttribute("src");
     if (synth) synth.cancel();
   }
 
   function narrEnqueue(items) {
     if (!narrOn || !items.length) return;
     for (const it of items) narrQ.push(it);
+    narrAhead();
     narrPump();
   }
 
+  // Start synthesis for the next few queued sentences. The rate is baked into the
+  // audio, so anything fetched at a stale rate is thrown away when the slider moves.
+  function narrAhead() {
+    if (!ttsOK) return;
+    let n = 0;
+    for (const it of narrQ) {
+      if (n++ >= AHEAD) break;
+      narrSynth(it);
+    }
+  }
+
+  function narrSynth(it) {
+    if (!it.say || it.wav) return;
+    it.rate = narrRate;
+    it.ctrl = new AbortController();
+    const ctrl = it.ctrl;
+    it.wav = fetch("/api/tts", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: it.say, rate: it.rate }), signal: ctrl.signal,
+    }).then((r) => (r.ok ? r.blob() : null)).catch(() => null);
+  }
+
   function narrPump() {
-    if (narrBusy || !narrQ.length || !synth) return;
+    if (narrBusy || !narrQ.length) return;
     const it = narrQ.shift();
     if (it.fire) it.fire();
     if (!it.say) { narrPump(); return; }
-    const tok = narrToken;
-    narrCurrent = it;
-    const u = new SpeechSynthesisUtterance(it.say);
-    if (narrVoice) { u.voice = narrVoice; u.lang = narrVoice.lang; }
-    u.rate = narrRate;
     narrBusy = true;
+    narrCurrent = it;
+    const tok = narrToken;
     const next = () => {
       if (tok !== narrToken) return;     // a stop happened while we were talking
+      narrDrop(it);
       narrBusy = false;
       narrCurrent = null;
       narrPump();
     };
+    narrAhead();
+
+    if (ttsOK) {
+      narrSynth(it);
+      it.wav.then((blob) => {
+        if (tok !== narrToken) return;
+        if (!blob) { ttsOK = false; next(); return; }   // Piper died; fall back next time
+        it.url = URL.createObjectURL(blob);
+        audioEl.src = it.url;
+        audioEl.playbackRate = 1;
+        audioEl.onended = next;
+        audioEl.onerror = next;
+        audioEl.play().catch(next);
+      });
+      return;
+    }
+    if (!synth) { next(); return; }
+    const u = new SpeechSynthesisUtterance(it.say);
+    if (narrVoice) { u.voice = narrVoice; u.lang = narrVoice.lang; }
+    u.rate = narrRate;
     u.onend = next;
     u.onerror = next;
     synth.speak(u);
@@ -2545,8 +2786,11 @@ textarea:focus { outline: none; border-color: var(--accent); }
     }
     parts.push({ say: narrClean(text.slice(last)), idx: pendingIdx });
 
-    // Long chunks become one utterance per sentence so the voice stays interruptible
-    // and Chrome never truncates; only the first sentence carries the chip.
+    // One chunk per sentence, and never more than one: this list has to be a stable
+    // PREFIX as the answer streams in, because the queue is advanced by counting what
+    // has already been sent. Merging short sentences together would break that -- a
+    // sentence that stood alone in one pass would vanish into its neighbour in the
+    // next, and the text in between would never be spoken at all.
     const out = [];
     let carry = null;
     for (const p of parts) {
@@ -2554,17 +2798,11 @@ textarea:focus { outline: none; border-color: var(--accent); }
       if (!p.say) { carry = i; continue; }
       carry = null;
       const sents = p.say.match(/[^.!?]+[.!?]+[)"'”]?\s*|[^.!?]+$/g) || [p.say];
-      let buf = "";
-      const flush = () => {
-        if (!buf.trim()) return;
-        out.push({ say: buf.trim(), idx: i });
-        i = null; buf = "";
-      };
-      for (const s of sents) {
-        if ((buf + s).length > 260) flush();
-        buf += s;
+      for (const sent of sents) {
+        if (!sent.trim()) continue;
+        out.push({ say: sent.trim(), idx: i });
+        i = null;
       }
-      flush();
     }
     if (carry !== null) out.push({ say: "", idx: carry });
     return out.map((c) => ({
@@ -2646,7 +2884,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
     rateEl.value = String(narrRate);
     $("rateVal").textContent = narrRate.toFixed(2).replace(/0$/, "") + "\u00d7";
   }
-  if (!synth) voiceBtn.hidden = true;
+
   voiceBtn.onclick = () => {
     narrOn = !narrOn;
     localStorage.setItem("cw.voice", narrOn ? "1" : "0");
@@ -2665,7 +2903,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
     clearTimeout(rateTimer);
     const apply = () => {
       if (!narrBusy) return;
-      const rest = narrQ.slice();
+      const rest = narrQ.map((it) => ({ say: it.say, fire: it.fire }));
       const cur = narrCurrent;
       narrStop();
       narrOn = true;
@@ -2949,6 +3187,9 @@ textarea:focus { outline: none; border-color: var(--accent); }
     }
     if (d.handoff) setInterval(() => { fetch("/api/ping").catch(() => {}); }, 3000);
     setupCells();
+    ttsOK = !!d.tts;
+    if (!ttsOK && !synth) { narrOn = false; voiceBtn.hidden = true; }
+    setVoiceBtn();
     setupModel(d.model, d.models);
     setupProposals();
     setupPrefetch();
@@ -2975,6 +3216,10 @@ def main():
     ap.add_argument("root", nargs="?", default=".", help="project root (default: .)")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--model", default="opus", help="alias passed to `claude --model`")
+    ap.add_argument("--demo", nargs="?", const="", metavar="SCRIPT",
+                    help="serve canned answers from a script file instead of calling the "
+                         "model, for working on the page itself (default: "
+                         "demo-walkthrough.md next to codewalk.py)")
     ap.add_argument(
         "--resume", metavar="SESSION", nargs="?", const="latest", default=None,
         help="start the chat from an existing Claude Code session so it already knows what you "
@@ -3038,10 +3283,20 @@ def main():
     Handler.sync_path = os.path.abspath(args.sync_file) if args.sync_file else None
     Handler.repo = Repo(args.root)
     Handler.shadow = Shadow(args.shadow or default_shadow(Handler.repo.root), Handler.repo)
-    Handler.claude = Claude(
-        args.model, Handler.repo.root, parent, brief, shadow=Handler.shadow.root,
-    )
-    Handler.models = MODELS + ([args.model] if args.model not in MODELS else [])
+    if args.demo is not None:
+        script = args.demo or os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                           "demo-walkthrough.md")
+        try:
+            Handler.claude = Script(script)
+        except OSError as e:
+            sys.exit(f"codewalk: could not read --demo script: {e}")
+        Handler.models = ["demo"]
+    else:
+        Handler.claude = Claude(
+            args.model, Handler.repo.root, parent, brief, shadow=Handler.shadow.root,
+        )
+        Handler.models = MODELS + ([args.model] if args.model not in MODELS else [])
+    Handler.voice = Voice(*find_piper())
     n = len(Handler.repo.files())
 
     httpd = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
