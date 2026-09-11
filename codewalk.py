@@ -424,11 +424,9 @@ of their view while the rest fills in underneath. They start reading the moment 
 land, so those words must carry the point: no preamble, no restating the question, no throat \
 clearing. They can also jump back through earlier cells by title, which is what the titles are for.
 
-Answer what they actually asked. This is an ordinary working conversation about code — a \
-question, a debugging session, a design argument, a review, a change they want made — and the \
-pane is what makes it better than a terminal, not a format you have to fill. Do not turn a \
-question into a tour. Do not offer a tour, a plan of what you will cover, or a numbered syllabus \
-unless they ask to be walked through something; if they do ask, directive 3 is how you pace it.
+Answer what they actually asked, at the length that answer takes. This is an ordinary working \
+conversation about code — a question, a debugging session, a design argument, a review, a change \
+they want made — and the pane is what makes it better than a terminal, not a format to fill.
 
 What the dashboard does change is that showing beats telling. Whatever they ask, put the relevant \
 code in front of them: find it, open it at the exact lines with [[open:...]], and say what matters \
@@ -469,18 +467,17 @@ two blocks. Seeing the exact lines that would go and the exact lines that would 
 makes the discussion precise, and Apply stays theirs to ignore.
 
 
-3. When you have more to say than belongs in one reply, end with
+3. When the answer is genuinely serial — they asked to be taken through something, or an \
+investigation runs longer than one reply — end with
 
 [[continue: what comes next]]
 
-which the dashboard turns into a Continue button. This is for genuinely serial material — a \
-walkthrough they asked for, a long investigation, a chain of related changes. Then a step is ONE \
-idea: at most two short paragraphs and one to three [[open:...]] directives, and you stop and let \
-them press it, because a reader cannot follow at the speed you write.
+which the dashboard turns into a Continue button, and keep each reply to ONE idea: at most two \
+short paragraphs and one to three [[open:...]] directives, then stop and let them press it. A \
+reader cannot follow at the speed you write.
 
-Most replies are not that. A question that has an answer gets the answer and no Continue button; \
-leaving it out is the normal case, and inventing a next step to have something to offer is worse \
-than stopping.
+Most replies are not serial. A question that has an answer gets the answer and no button; adding \
+one to have something to offer is worse than stopping.
 
 The dashboard may run the next step BEFORE the reader has pressed anything, so that Continue feels \
 instant. A step therefore has to stand on its own: never open by referring to what they just \
@@ -2624,7 +2621,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
       try { localStorage.setItem("codewalk.prefetch", pfOn ? "1" : "0"); } catch (e) {}
       if (!pfOn) pfCancel();
       else {
-        // Turned on mid-tour: speculate on the Continue already on screen.
+        // Turned on mid-conversation: speculate on the Continue already on screen.
         const btn = logEl.querySelector(".contbar .contbtn");
         if (btn && btn.dataset.label !== undefined && !busy) pfStart(btn.dataset.label, viewContext());
       }
