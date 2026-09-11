@@ -1601,7 +1601,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
   <div class="sash" id="sash2" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize chat"></div>
 
   <section class="pane" id="chat">
-    <div class="paneHead"><span>Walkthrough</span><span class="spacer"></span><select class="iconbtn" id="model" title="Which model answers. Takes effect on the next question; the conversation so far is kept."></select><button class="iconbtn" id="voice" title="Read the walkthrough aloud and move the editor in time with the voice">Voice: off</button><span class="rateWrap" id="rateWrap" hidden title="Speaking speed — drag, or Alt+, / Alt+. "><input type="range" id="rate" min="0.6" max="2.2" step="0.05" value="1.05" aria-label="Speaking speed"><span id="rateVal">1.05×</span></span><button class="iconbtn" id="follow" title="Let Claude move the editor as it explains">Follow: on</button><button class="iconbtn" id="clearHl" disabled>Clear highlight</button><button class="iconbtn" id="cellPrev" title="Previous step (Alt+Up)" disabled>&#8593;</button><button class="iconbtn" id="cellNext" title="Next step (Alt+Down)" disabled>&#8595;</button></div>
+    <div class="paneHead"><span>Walkthrough</span><span class="spacer"></span><select class="iconbtn" id="model" title="Which model answers. Takes effect on the next question; the conversation so far is kept."></select><button class="iconbtn" id="voice" title="Read the walkthrough aloud and move the editor in time with the voice">Voice: off</button><span class="rateWrap" id="rateWrap" hidden title="Speaking speed — drag, or Alt+, / Alt+. "><input type="range" id="rate" min="0.5" max="2" step="0.25" value="1" aria-label="Speaking speed"><span id="rateVal">1×</span></span><button class="iconbtn" id="follow" title="Let Claude move the editor as it explains">Follow: on</button><button class="iconbtn" id="clearHl" disabled>Clear highlight</button><button class="iconbtn" id="cellPrev" title="Previous step (Alt+Up)" disabled>&#8593;</button><button class="iconbtn" id="cellNext" title="Next step (Alt+Down)" disabled>&#8595;</button></div>
     <div id="logwrap">
       <button id="jumpDown" hidden title="Jump to the latest step">&#8595; latest</button>
       <div id="log"><div id="tailpad"></div></div>
@@ -2637,7 +2637,11 @@ textarea:focus { outline: none; border-color: var(--accent); }
   // was written, which is how a person points at code while talking about it.
   const synth = window.speechSynthesis || null;
   let narrOn = localStorage.getItem("cw.voice") === "1";
-  let narrRate = Number(localStorage.getItem("cw.rate") || 1.05);
+  // Quarter steps, so the slider lands on a speed you can name rather than on 1.13.
+  const RATE_STEP = 0.25, RATE_MIN = 0.5, RATE_MAX = 2;
+  const snapRate = (v) => Math.min(RATE_MAX, Math.max(RATE_MIN,
+                            Math.round(v / RATE_STEP) * RATE_STEP));
+  let narrRate = snapRate(Number(localStorage.getItem("cw.rate")) || 1);
   let narrVoice = null;
   let narrQ = [];          // queued {say, fire, idx, scope}
   let narrBusy = false;
@@ -3016,7 +3020,8 @@ textarea:focus { outline: none; border-color: var(--accent); }
     voiceBtn.style.color = narrOn ? "var(--hl-rail)" : "";
     rateWrap.hidden = !narrOn;
     rateEl.value = String(narrRate);
-    $("rateVal").textContent = narrRate.toFixed(2).replace(/0$/, "") + "\u00d7";
+    $("rateVal").textContent = (narrRate % 1 ? narrRate.toFixed(2).replace(/0$/, "")
+                                            : narrRate.toFixed(0)) + "\u00d7";
   }
 
   voiceBtn.onclick = () => {
@@ -3032,7 +3037,9 @@ textarea:focus { outline: none; border-color: var(--accent); }
   // on every pixel would stutter.
   let rateTimer = null;
   function setRate(v, immediate) {
-    narrRate = Math.min(2.2, Math.max(0.6, Math.round(v * 20) / 20));
+    const was = narrRate;
+    narrRate = snapRate(v);
+    if (narrRate === was) { setVoiceBtn(); return; }   // the drag has not left this step
     localStorage.setItem("cw.rate", String(narrRate));
     setVoiceBtn();
     clearTimeout(rateTimer);
@@ -3051,8 +3058,8 @@ textarea:focus { outline: none; border-color: var(--accent); }
   rateEl.onchange = () => setRate(Number(rateEl.value), true);
   document.addEventListener("keydown", (e) => {
     if (!e.altKey || e.ctrlKey || e.metaKey) return;
-    if (e.key === ",") { e.preventDefault(); setRate(narrRate - 0.1, true); }
-    if (e.key === ".") { e.preventDefault(); setRate(narrRate + 0.1, true); }
+    if (e.key === ",") { e.preventDefault(); setRate(narrRate - RATE_STEP, true); }
+    if (e.key === ".") { e.preventDefault(); setRate(narrRate + RATE_STEP, true); }
   });
   setVoiceBtn();
 
