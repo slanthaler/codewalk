@@ -2735,8 +2735,26 @@ textarea:focus { outline: none; border-color: var(--accent); }
     synth.speak(u);
   }
 
-  // Where it is safe to stop reading a half-written answer: the last sentence or
-  // paragraph break, never inside an unfinished fence, edit block or directive.
+  // ONE definition of where a spoken unit ends, used by both the splitter and the
+  // stable-prefix cut. They have to agree exactly: if the prefix could end anywhere
+  // the splitter does not also split, a unit would be short in one pass and whole in
+  // the next, the chunk count would not grow, and the text in between would be lost.
+  const UNIT_END = /[.!?]+[)"'”]*(?=\s|$)|\n\n/g;
+
+  function narrUnits(text) {
+    const out = [];
+    let last = 0, m;
+    UNIT_END.lastIndex = 0;
+    while ((m = UNIT_END.exec(text))) {
+      out.push(text.slice(last, m.index + m[0].length));
+      last = UNIT_END.lastIndex;
+    }
+    if (last < text.length) out.push(text.slice(last));
+    return out;
+  }
+
+  // Where it is safe to stop reading a half-written answer: the end of the last
+  // complete unit, never inside an unfinished fence, edit block or directive.
   function narrStable(text) {
     let cut = text.length;
     for (const open of ["```", "[[edit:"]) {
@@ -2749,8 +2767,10 @@ textarea:focus { outline: none; border-color: var(--accent); }
     const bracket = text.lastIndexOf("[[");
     if (bracket !== -1 && text.indexOf("]]", bracket) === -1) cut = Math.min(cut, bracket);
     const head = text.slice(0, cut);
-    const m = head.match(/^[\s\S]*(?:[.!?:;][)"'”]?\s|\n\n)/);
-    return m ? m[0] : "";
+    let end = 0, m;
+    UNIT_END.lastIndex = 0;
+    while ((m = UNIT_END.exec(head))) end = UNIT_END.lastIndex;
+    return head.slice(0, end);
   }
 
   const NARR_DROP = /\[\[[^\]]*\]\]/g;
@@ -2775,6 +2795,9 @@ textarea:focus { outline: none; border-color: var(--accent); }
     while ((cm = CODE_RE.exec(text))) codeSpans.push([cm.index, cm.index + cm[0].length]);
     const inCode = (i) => codeSpans.some(([a, b]) => i >= a && i < b);
 
+    // A chip is not punctuation, it is the words the sentence uses at that point --
+    // "the whole server is here, the module docstring, and the contract..." reads the
+    // way it looks on screen. So the label is spoken, and it opens the chunk it labels.
     const parts = [];            // {say, idx}  idx = chip to activate when it starts
     let last = 0, idx = 0, pendingIdx = null, m;
     OPEN_RE.lastIndex = 0;
@@ -2783,6 +2806,8 @@ textarea:focus { outline: none; border-color: var(--accent); }
       parts.push({ say: narrClean(text.slice(last, m.index)), idx: pendingIdx });
       pendingIdx = idx++;
       last = m.index + m[0].length;
+      const label = (m[3] || "").trim();
+      if (label) parts.push({ say: narrClean(label), idx: pendingIdx, label: true });
     }
     parts.push({ say: narrClean(text.slice(last)), idx: pendingIdx });
 
@@ -2792,18 +2817,27 @@ textarea:focus { outline: none; border-color: var(--accent); }
     // sentence that stood alone in one pass would vanish into its neighbour in the
     // next, and the text in between would never be spoken at all.
     const out = [];
-    let carry = null;
+    let carry = null, pendingLabel = "";
     for (const p of parts) {
       let i = p.idx === null ? carry : p.idx;
       if (!p.say) { carry = i; continue; }
       carry = null;
-      const sents = p.say.match(/[^.!?]+[.!?]+[)"'”]?\s*|[^.!?]+$/g) || [p.say];
+      if (p.label) { pendingLabel = p.say; carry = i; continue; }   // spoken with what follows
+      const sents = narrUnits(p.say);
       for (const sent of sents) {
         if (!sent.trim()) continue;
-        out.push({ say: sent.trim(), idx: i });
+        const rest = sent.trim();
+        // The prose after a chip often starts with its own comma; two in a row makes
+        // Piper pause twice.
+        const say = pendingLabel
+          ? pendingLabel + (/^[,.;:!?]/.test(rest) ? "" : ",") + " " + rest
+          : rest;
+        pendingLabel = "";
+        out.push({ say: say, idx: i });
         i = null;
       }
     }
+    if (pendingLabel) out.push({ say: pendingLabel, idx: carry });
     if (carry !== null) out.push({ say: "", idx: carry });
     return out.map((c) => ({
       say: c.say,
