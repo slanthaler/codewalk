@@ -41,6 +41,28 @@ const F = {};
 eval(core + "\nObject.assign(F, {CONT_RE, TITLE_RE, EDIT_RE, FENCE_RE, OPEN_RE, narrFeed, narrClean});");
 
 
+// Written for the eye, said for the ear.
+const SPEECH_CASES = [
+  ["A single full attention over (bv, n+v, d) would be expensive.",
+   "A single full attention over bv by n plus v by d would be expensive."],
+  ["shape (batch, seq_len, d_model)", "shape batch by seq_len by d_model"],
+  ["rate >= 0.5 and dim=2", "rate at least 0.5 and dim equals 2"],
+  ["maps x -> y in a 3 x 4 grid", "maps x to y in a 3 by 4 grid"],
+  ["the (only) caveat", "the (only) caveat"],                  // prose parens are left alone
+  ["call predict_batch(x, horizon=64)", "call predict_batch(x, horizon equals 64)"],
+];
+let speechBad = 0;
+for (const [from, want] of SPEECH_CASES) {
+  const got = F.narrClean(from);
+  if (got !== want) {
+    speechBad++;
+    console.log("speech: " + JSON.stringify(from) + "\n   got:  " + JSON.stringify(got) +
+                "\n   want: " + JSON.stringify(want));
+  }
+}
+console.log(speechBad ? `speech: ${speechBad}/${SPEECH_CASES.length} wrong`
+                      : `speech: ${SPEECH_CASES.length} phrasings read as words`);
+
 const demo = fs.readFileSync(path.join(__dirname, "demo-walkthrough.md"), "utf8");
 const turns = demo.replace(/^(?:#[^\n]*\n|\s*\n)+/, "").split(/^===[^\n]*\n/m)
                   .map((t) => t.trim()).filter(Boolean);
@@ -81,4 +103,4 @@ turns.forEach((turn, n) => {
 });
 
 console.log(bad ? `\nFAIL: ${bad}/${turns.length} turns lose text` : `\nPASS: ${turns.length} turns speak every word`);
-process.exit(bad ? 1 : 0);
+process.exit(bad || speechBad ? 1 : 0);

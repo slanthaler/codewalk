@@ -510,6 +510,20 @@ context.
 {brief}"""
 
 
+VOICE_NOTE = """
+The user is LISTENING to this answer, not reading it: it is being spoken aloud while they watch the
+code pane. Write prose that survives being heard.
+
+Say things in words rather than symbols. A shape is "batch by variates by model width", not
+"(bv, n+v, d)"; a condition is "at least one", not ">= 1". Where the exact symbols are the point,
+put them on the screen instead — point at the line with [[open:...]] and describe in words what it
+says. Identifiers are fine to name, but a sentence that is mostly punctuation is unlistenable.
+
+Keep sentences short enough to follow without a second reading, and put the subject early. Avoid
+parentheses inside sentences: a spoken aside has no brackets, so fold it into its own sentence.
+"""
+
+
 CONTINUE_PROMPT = "Continue."
 
 INHERITED_NOTE = """
@@ -973,6 +987,7 @@ class Handler(BaseHTTPRequestHandler):
     first_question: str = ""
     models: list = []
     voice: "Voice" = None      # type: ignore[assignment]
+    voice_on: bool = False     # the page is reading answers aloud
 
     def log_message(self, fmt, *args):
         pass
@@ -1081,6 +1096,7 @@ class Handler(BaseHTTPRequestHandler):
             Handler.handback.set()
         elif path == "/api/ask":
             b = self._body()
+            Handler.voice_on = bool(b.get("voice"))
             self._ask(b.get("q", ""), b.get("context", ""), b.get("cont") or "")
         elif path == "/api/prefetch":
             b = self._body()
@@ -1127,8 +1143,11 @@ class Handler(BaseHTTPRequestHandler):
                 "left": len(Handler.shadow.entries())}
 
     def _system(self) -> str:
+        # The brief still outranks everything; the voice note sits just above it because
+        # how to phrase an answer is a smaller matter than what the answer is about.
+        brief = (VOICE_NOTE + self.claude.brief) if Handler.voice_on else self.claude.brief
         return RULES.format(
-            root=self.repo.root, inherited=self.claude.inherited, brief=self.claude.brief,
+            root=self.repo.root, inherited=self.claude.inherited, brief=brief,
             shadow=Handler.shadow.root,
         )
 
@@ -2873,11 +2892,44 @@ textarea:focus { outline: none; border-color: var(--accent); }
   }
 
   const NARR_DROP = /\[\[[^\]]*\]\]/g;
+
+  // Written for the eye, said for the ear. "(bv, n+v, d)" is fine on screen and
+  // unbearable spoken, so the shapes and operators that show up constantly in this
+  // kind of prose are turned into the words a person would actually say. This is the
+  // safety net: the model is also told to phrase things for listening, but it will
+  // always reach for symbols sometimes, and the reader should not have to suffer them.
+  const SHAPE = /\(([^()\n]{1,60})\)/g;          // a parenthesised tuple, maybe a shape
+  const SHAPEY = /^[\w\s,+*/\-]+$/;               // ...only if it is all symbols and names
+
+  const SAY = [
+    [/\s*(?:->|→|=>)\s*/g, " to "],
+    [/\s*==\s*/g, " equals "],
+    [/\s*!=\s*/g, " is not "],
+    [/\s*>=\s*/g, " at least "],
+    [/\s*<=\s*/g, " at most "],
+    [/(\w)\s*=\s*(\w)/g, "$1 equals $2"],
+    [/(\w)\s*\+\s*(\w)/g, "$1 plus $2"],
+    [/(\w)\s*\*\s*(\w)/g, "$1 times $2"],
+    [/(\d)\s*[x\u00d7]\s*(\d)/g, "$1 by $2"],
+    [/(\w)\s*\|\s*(\w)/g, "$1 or $2"],
+  ];
+
+  function speechify(s) {
+    s = s.replace(SHAPE, (m, inner) => {
+      if (!inner.includes(",") || !SHAPEY.test(inner)) return m;
+      // A shape is read the way it is said out loud: b by n by d, not b comma n comma d.
+      return " " + inner.split(",").map((t) => t.trim()).filter(Boolean).join(" by ") + " ";
+    });
+    for (const [re, to] of SAY) s = s.replace(re, to);
+    return s;
+  }
+
   function narrClean(s) {
-    return s.replace(NARR_DROP, " ")
+    return speechify(s.replace(NARR_DROP, " ")
             .replace(/`([^`\n]+)`/g, "$1")
             .replace(/\*\*([^*\n]+)\*\*/g, "$1")
-            .replace(/\*([^*\n]+)\*/g, "$1")
+            .replace(/\*([^*\n]+)\*/g, "$1"))
+            .replace(/\s+([,.;:!?])/g, "$1")
             .replace(/\s+/g, " ")
             .trim();
   }
@@ -3123,7 +3175,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
     try {
       const res = await fetch("/api/ask", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ q: q, context: context, cont: claim }),
+        body: JSON.stringify({ q: q, context: context, cont: claim, voice: narrOn }),
       });
       const reader = res.body.getReader();
       const dec = new TextDecoder();
