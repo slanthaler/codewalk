@@ -2689,7 +2689,20 @@ textarea:focus { outline: none; border-color: var(--accent); }
   function narrDrop(it) {
     if (it.ctrl) { try { it.ctrl.abort(); } catch (e) {} }
     if (it.url) { URL.revokeObjectURL(it.url); it.url = null; }
+    for (const t of it.timers || []) clearTimeout(t);
+    it.timers = null;
     it.ctrl = null; it.wav = null;
+  }
+
+  // Light the chips this sentence points at: the first one as it starts, the rest
+  // scheduled against the audio's own duration.
+  function narrMarks(it, duration) {
+    it.timers = [];
+    for (const mk of it.marks || []) {
+      const at = duration && mk.frac > 0.02 ? duration * mk.frac : 0;
+      if (!at) { mk.fire(); continue; }
+      it.timers.push(setTimeout(mk.fire, at * 1000));
+    }
   }
 
   function narrStop() {
@@ -2736,8 +2749,11 @@ textarea:focus { outline: none; border-color: var(--accent); }
   function narrPump() {
     if (narrBusy || narrBlocked || !narrQ.length) return;
     const it = narrQ.shift();
-    if (it.fire && !it.fired) { it.fire(); it.fired = true; }
-    if (!it.say) { narrPump(); return; }
+    if (!it.say) {                       // a directive with nothing to say around it
+      narrMarks(it, 0);
+      narrPump();
+      return;
+    }
     narrBusy = true;
     narrCurrent = it;
     const tok = narrToken;
@@ -2760,11 +2776,16 @@ textarea:focus { outline: none; border-color: var(--accent); }
         audioEl.playbackRate = 1;
         audioEl.onended = next;
         audioEl.onerror = next;
+        audioEl.onloadedmetadata = () => {
+          if (tok !== narrToken || it.timers) return;
+          narrMarks(it, isFinite(audioEl.duration) ? audioEl.duration : 0);
+        };
         audioEl.play().catch((err) => {
           if (tok !== narrToken) return;
           if (err && err.name === "NotAllowedError") {
             narrQ.unshift(it);          // hold the sentence, do not skip it
-            it.fired = true;            // its chip is already lit; do not fire twice
+            for (const t of it.timers || []) clearTimeout(t);
+            it.timers = null;           // the chips will be lit again on the retry
             narrBusy = false;
             narrCurrent = null;
             narrBlocked = true;
@@ -2782,6 +2803,17 @@ textarea:focus { outline: none; border-color: var(--accent); }
     const u = new SpeechSynthesisUtterance(it.say);
     if (narrVoice) { u.voice = narrVoice; u.lang = narrVoice.lang; }
     u.rate = narrRate;
+    u.onboundary = (e) => {              // speechSynthesis does report progress
+      const frac = e.charIndex / Math.max(1, it.say.length);
+      for (const mk of it.marks || []) {
+        if (!mk.done && frac >= mk.frac) { mk.done = true; mk.fire(); }
+      }
+    };
+    u.onstart = () => {                  // whatever sits at the very start of it
+      for (const mk of it.marks || []) {
+        if (mk.frac <= 0.02 && !mk.done) { mk.done = true; mk.fire(); }
+      }
+    };
     u.onend = next;
     u.onerror = next;
     synth.speak(u);
@@ -2846,72 +2878,66 @@ textarea:focus { outline: none; border-color: var(--accent); }
             .trim();
   }
 
-  // Split the answer into speakable chunks, each optionally carrying the index of the
-  // [[open:...]] chip that should light up the instant that chunk starts.
+  // Split the answer into speakable chunks: one sentence each, with the chips that
+  // fall inside it and how far through the words each one sits.
+  //
+  // A chip is not punctuation -- it is the words the sentence uses at that point, so
+  // the label is spoken inline and the sentence stays one utterance. Speaking the
+  // label separately is what made the voice sound strange: Piper gives every request
+  // sentence-final intonation and a pause, so "the primary path, with" landed like a
+  // finished sentence and the label after it started a new one.
   function narrChunks(text, scope) {
     text = text.replace(CONT_RE, "").replace(TITLE_RE, "");
     text = text.replace(EDIT_RE, (m, p) => " Proposing an edit to " + shortPath(p) + ". ");
     text = text.replace(FENCE_RE, " (code block in the chat.) ");
 
-    const codeSpans = [];
-    let cm; const CODE_RE = /`[^`\n]+`/g;
-    while ((cm = CODE_RE.exec(text))) codeSpans.push([cm.index, cm.index + cm[0].length]);
-    const inCode = (i) => codeSpans.some(([a, b]) => i >= a && i < b);
-
-    // A chip is not punctuation, it is the words the sentence uses at that point --
-    // "the whole server is here, the module docstring, and the contract..." reads the
-    // way it looks on screen. So the label is spoken, and it opens the chunk it labels.
-    const parts = [];            // {say, idx}  idx = chip to activate when it starts
-    let last = 0, idx = 0, pendingIdx = null, m;
+    // Substitute each directive with the words it shows, remembering where the chip
+    // lands in the resulting prose.
+    const spans = codeSpans(text);
+    let prose = "", last = 0, idx = 0, m;
+    const marks = [];
     OPEN_RE.lastIndex = 0;
     while ((m = OPEN_RE.exec(text))) {
-      if (!isPath(m[1]) || inCode(m.index)) continue;
-      parts.push({ say: narrClean(text.slice(last, m.index)), idx: pendingIdx });
-      pendingIdx = idx++;
+      if (!isPath(m[1])) continue;
+      if (spans.some(([a, b]) => m.index >= a && m.index + m[0].length <= b)) continue;
+      prose += text.slice(last, m.index);
+      marks.push({ at: prose.length, idx: idx++ });
+      prose += (m[3] || "").replace(/`/g, "").trim();
       last = m.index + m[0].length;
-      const label = (m[3] || "").trim();
-      if (label) parts.push({ say: narrClean(label), idx: pendingIdx, label: true });
     }
-    parts.push({ say: narrClean(text.slice(last)), idx: pendingIdx });
+    prose += text.slice(last);
 
-    // One chunk per sentence, and never more than one: this list has to be a stable
-    // PREFIX as the answer streams in, because the queue is advanced by counting what
-    // has already been sent. Merging short sentences together would break that -- a
-    // sentence that stood alone in one pass would vanish into its neighbour in the
-    // next, and the text in between would never be spoken at all.
+    const fireFor = (i) => () => {
+      const ds = allDirectives(scope.raw || "");
+      const d = ds[i];
+      if (d) openFile(d.path, d.spec);
+      if (scope.el) markActiveChip(scope.el, i);
+    };
+
+    // One chunk per unit, and never more than one: this list has to be a stable PREFIX
+    // as the answer streams in, because the queue is advanced by counting what has
+    // already been sent. Merge two units and a sentence that stood alone in one pass
+    // vanishes into its neighbour in the next, taking the text between them with it.
     const out = [];
-    let carry = null, pendingLabel = "";
-    for (const p of parts) {
-      let i = p.idx === null ? carry : p.idx;
-      if (!p.say) { carry = i; continue; }
-      carry = null;
-      if (p.label) { pendingLabel = p.say; carry = i; continue; }   // spoken with what follows
-      const sents = narrUnits(p.say);
-      for (const sent of sents) {
-        if (!sent.trim()) continue;
-        const rest = sent.trim();
-        // The prose after a chip often starts with its own comma; two in a row makes
-        // Piper pause twice.
-        const say = pendingLabel
-          ? pendingLabel + (/^[,.;:!?]/.test(rest) ? "" : ", ") + rest
-          : rest;
-        pendingLabel = "";
-        out.push({ say: say, idx: i });
-        i = null;
+    let pos = 0;
+    for (const unit of narrUnits(prose)) {
+      const start = pos, end = pos + unit.length;
+      pos = end;
+      const mine = marks.filter((k) => k.at >= start && k.at < end);
+      const say = narrClean(unit);
+      if (!say) {
+        for (const k of mine) out.push({ say: "", marks: [{ frac: 0, fire: fireFor(k.idx) }] });
+        continue;
       }
+      out.push({
+        say: say,
+        // Where in the audio each chip belongs, as a fraction of the sentence. Piper
+        // reports no word timings, so this is proportional to characters -- close
+        // enough that the pane moves on the phrase that names it.
+        marks: mine.map((k) => ({ frac: (k.at - start) / unit.length, fire: fireFor(k.idx) })),
+      });
     }
-    if (pendingLabel) out.push({ say: pendingLabel, idx: carry });
-    if (carry !== null) out.push({ say: "", idx: carry });
-    return out.map((c) => ({
-      say: c.say,
-      idx: c.idx,
-      fire: c.idx === null ? null : () => {
-        const ds = allDirectives(scope.raw || "");
-        const d = ds[c.idx];
-        if (d) openFile(d.path, d.spec);
-        if (scope.el) markActiveChip(scope.el, c.idx);
-      },
-    }));
+    return out;
   }
 
   // Every finished answer keeps its raw text, so it can be read aloud again later.
@@ -3012,11 +3038,11 @@ textarea:focus { outline: none; border-color: var(--accent); }
     clearTimeout(rateTimer);
     const apply = () => {
       if (!narrBusy) return;
-      const rest = narrQ.map((it) => ({ say: it.say, fire: it.fire }));
+      const rest = narrQ.map((it) => ({ say: it.say, marks: it.marks }));
       const cur = narrCurrent;
       narrStop();
       narrOn = true;
-      if (cur) rest.unshift({ say: cur.say, fire: null });   // repeat it, do not re-open
+      if (cur) rest.unshift({ say: cur.say, marks: [] });    // repeat it, do not re-open
       narrEnqueue(rest);
     };
     rateTimer = setTimeout(apply, immediate ? 0 : 260);

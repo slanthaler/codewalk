@@ -27,6 +27,7 @@ const core = [
   grab("  const OPEN_RE", "  function renderReply"),
   grab("  const FENCE_RE", "  function snippet"),
   grab("  // ONE definition of where a spoken unit ends", "  function narrReplay"),
+  grab("  // Inline-code spans, the one place both", "  function scanDirectives"),
   grab("  function isPath", "  function allDirectives"),
   grab("  function allDirectives", "  function markActiveChip"),
   grab("  function shortPath", "  function inline"),
@@ -74,7 +75,8 @@ turns.forEach((turn, n) => {
     console.log("   said: ..." + a.slice(Math.max(0, i - 40), i + 100));
     console.log("   want: ..." + b.slice(Math.max(0, i - 40), i + 100));
   } else {
-    console.log(`turn ${n}: ok  (${spoken.length} chunks, ${spoken.filter((c) => c.idx !== null).length} chips)`);
+    const chips = spoken.reduce((n2, c) => n2 + (c.marks || []).length, 0);
+    console.log(`turn ${n}: ok  (${spoken.length} chunks, ${chips} chips)`);
   }
 });
 
