@@ -528,6 +528,11 @@ def find_session(spec: str, context_dir: str) -> str | None:
     return os.path.splitext(os.path.basename(newest))[0]
 
 
+# Aliases `claude --model` accepts. The page offers these; --model can name anything
+# else and it is added to the list so the session's own choice stays selectable.
+MODELS = ["opus", "sonnet", "haiku"]
+
+
 class Claude:
     """One `claude -p` session over the repo, resumed across turns.
 
@@ -797,6 +802,7 @@ class Handler(BaseHTTPRequestHandler):
     synced_upto: int = 0
     shadow: "Shadow" = None      # type: ignore[assignment]
     first_question: str = ""
+    models: list = []
 
     def log_message(self, fmt, *args):
         pass
@@ -845,6 +851,8 @@ class Handler(BaseHTTPRequestHandler):
                 "handoff": Handler.handoff,
                 "first_question": Handler.first_question,
                 "sync": bool(Handler.sync_path),
+                "model": self.claude.model,
+                "models": Handler.models,
                 "files": self.repo.files(),
             })
         elif path == "/api/file":
@@ -906,6 +914,17 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/prefetch":
             b = self._body()
             self._json(self._prefetch(b.get("label") or "", b.get("context", "")))
+        elif path == "/api/model":
+            b = self._body()
+            want = str(b.get("model") or "")
+            if want not in Handler.models:
+                self._json({"ok": False, "error": "unknown model"}, 400)
+                return
+            # A guess in flight was made by the old model; it is no longer the answer
+            # this session would give, so drop it rather than serve it later.
+            self.claude.cancel_pending()
+            self.claude.model = want
+            self._json({"ok": True, "model": want})
         elif path == "/api/prefetch/cancel":
             self.claude.cancel_pending()
             self._json({"ok": True})
@@ -1172,6 +1191,7 @@ body {
 }
 .iconbtn:hover:not(:disabled) { color: var(--fg-dim); background: var(--bg-hover); }
 .iconbtn:disabled { opacity: 0.4; cursor: default; }
+select.iconbtn { padding: 2px 4px; text-transform: none; letter-spacing: 0; }
 .rateWrap { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--fg-faint); }
 .rateWrap input { width: 74px; accent-color: var(--hl-rail); cursor: pointer; }
 .rateWrap #rateVal { font-family: var(--mono); min-width: 34px; text-align: right; }
@@ -1398,7 +1418,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
   <div class="sash" id="sash2" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize chat"></div>
 
   <section class="pane" id="chat">
-    <div class="paneHead"><span>Walkthrough</span><span class="spacer"></span><button class="iconbtn" id="voice" title="Read the walkthrough aloud and move the editor in time with the voice">Voice: off</button><span class="rateWrap" id="rateWrap" hidden title="Speaking speed — drag, or Alt+, / Alt+. "><input type="range" id="rate" min="0.6" max="2.2" step="0.05" value="1.05" aria-label="Speaking speed"><span id="rateVal">1.05×</span></span><button class="iconbtn" id="follow" title="Let Claude move the editor as it explains">Follow: on</button><button class="iconbtn" id="clearHl" disabled>Clear highlight</button><button class="iconbtn" id="cellPrev" title="Previous step (Alt+Up)" disabled>&#8593;</button><button class="iconbtn" id="cellNext" title="Next step (Alt+Down)" disabled>&#8595;</button></div>
+    <div class="paneHead"><span>Walkthrough</span><span class="spacer"></span><select class="iconbtn" id="model" title="Which model answers. Takes effect on the next question; the conversation so far is kept."></select><button class="iconbtn" id="voice" title="Read the walkthrough aloud and move the editor in time with the voice">Voice: off</button><span class="rateWrap" id="rateWrap" hidden title="Speaking speed — drag, or Alt+, / Alt+. "><input type="range" id="rate" min="0.6" max="2.2" step="0.05" value="1.05" aria-label="Speaking speed"><span id="rateVal">1.05×</span></span><button class="iconbtn" id="follow" title="Let Claude move the editor as it explains">Follow: on</button><button class="iconbtn" id="clearHl" disabled>Clear highlight</button><button class="iconbtn" id="cellPrev" title="Previous step (Alt+Up)" disabled>&#8593;</button><button class="iconbtn" id="cellNext" title="Next step (Alt+Down)" disabled>&#8595;</button></div>
     <div id="logwrap">
       <button id="jumpDown" hidden title="Jump to the latest step">&#8595; latest</button>
       <div id="log"><div id="tailpad"></div></div>
@@ -2591,6 +2611,33 @@ textarea:focus { outline: none; border-color: var(--accent); }
     narrEnqueue(narrChunks(raw, state));
   }
 
+  // Model picker. A change lands on the next turn: the session is resumed, so the
+  // conversation so far is kept and only the model answering it changes.
+  const modelEl = $("model");
+  function setupModel(cur, list) {
+    for (const m of list || []) {
+      const o = document.createElement("option");
+      o.value = m; o.textContent = m;
+      modelEl.appendChild(o);
+    }
+    modelEl.value = cur || "";
+    modelEl.onchange = async () => {
+      const want = modelEl.value;
+      pfCancel();                 // the guess in flight came from the old model
+      try {
+        const r = await fetch("/api/model", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: want }),
+        });
+        const j = await r.json();
+        if (!j.ok) throw new Error(j.error || "rejected");
+        flash(want + " from the next question");
+      } catch (e) {
+        flash("could not switch model");
+      }
+    };
+  }
+
   const voiceBtn = $("voice"), rateEl = $("rate"), rateWrap = $("rateWrap");
   function setVoiceBtn() {
     voiceBtn.textContent = "Voice: " + (narrOn ? "on" : "off");
@@ -2902,6 +2949,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
     }
     if (d.handoff) setInterval(() => { fetch("/api/ping").catch(() => {}); }, 3000);
     setupCells();
+    setupModel(d.model, d.models);
     setupProposals();
     setupPrefetch();
     if (d.sync) setupSync();
@@ -2993,6 +3041,7 @@ def main():
     Handler.claude = Claude(
         args.model, Handler.repo.root, parent, brief, shadow=Handler.shadow.root,
     )
+    Handler.models = MODELS + ([args.model] if args.model not in MODELS else [])
     n = len(Handler.repo.files())
 
     httpd = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
