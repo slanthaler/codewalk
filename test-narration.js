@@ -38,7 +38,7 @@ function narrEnqueue(items) { for (const it of items) spoken.push(it); }
 // A direct eval keeps its const/let to itself, so the pieces the test needs are
 // handed back out explicitly. The point is to run the page's own code, not a copy.
 const F = {};
-eval(core + "\nObject.assign(F, {CONT_RE, TITLE_RE, EDIT_RE, FENCE_RE, OPEN_RE, SAY_RE, narrFeed, narrClean, unitStart});");
+eval(core + "\nObject.assign(F, {CONT_G, TITLE_RE, EDIT_RE, FENCE_RE, OPEN_RE, SAY_RE, narrFeed, narrClean, unitStart});");
 
 
 // Written for the eye, said for the ear.
@@ -97,7 +97,7 @@ turns.forEach((turn, n) => {
 
   const said = spoken.map((c) => c.say).filter(Boolean).join(" ");
   const want = F.narrClean(
-    applySay(turn).replace(F.CONT_RE, "").replace(F.TITLE_RE, "").replace(F.EDIT_RE, " ")
+    applySay(turn).replace(F.CONT_G, "").replace(F.TITLE_RE, "").replace(F.EDIT_RE, " ")
         .replace(F.FENCE_RE, " ")
         .replace(F.OPEN_RE, (m, p, spec, label) => (label ? " " + label + " " : " ")),
   );

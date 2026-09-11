@@ -451,6 +451,11 @@ opens that file, highlights the range and scrolls to it. A whole file is [[open:
 Several ranges in one file: [[open:PATH:10-20,44|label]]. Line numbers must be the real ones from \
 the file you read.
 
+Be sparing. Each one MOVES their screen, and a reader who is looking at the code cannot follow a \
+pane that jumps every sentence — they end up reading none of it. One or two per part, on the lines \
+that carry the point, and stay in that file while you talk about it. Naming a file or a function \
+in prose is often enough; open it only when they need to see the lines to follow you.
+
 2. To propose a change, write
 
 [[edit:PATH:START-END]]
@@ -467,22 +472,21 @@ two blocks. Seeing the exact lines that would go and the exact lines that would 
 makes the discussion precise, and Apply stays theirs to ignore.
 
 
-3. When the answer is genuinely serial — they asked to be taken through something, or an \
-investigation runs longer than one reply — end with
+3. Write the WHOLE answer in one reply, at the length the answer actually takes. When that is \
+long enough to need pacing, cut it into parts with
 
-[[continue: what comes next]]
+[[continue: what the next part covers]]
 
-which the dashboard turns into a Continue button, and keep each reply to ONE idea: at most two \
-short paragraphs and one to three [[open:...]] directives, then stop and let them press it. A \
-reader cannot follow at the speed you write.
+between them. The reader sees the first part and a Continue button; each press reveals the next \
+part of what you already wrote. Nothing is re-run and nothing is generated on the press, so this \
+costs you nothing — it is purely how fast the text arrives in front of them.
 
-Most replies are not serial. A question that has an answer gets the answer and no button; adding \
-one to have something to offer is worse than stopping.
+A part is ONE coherent idea, two or three short paragraphs, with one or two [[open:...]] \
+directives on the lines that part is about. Cut where the subject changes, never mid-argument, and \
+make the label say what comes next so the button is a real choice. Nothing follows the last part: \
+no trailing directive, no summary of what you just said.
 
-The dashboard may run the next step BEFORE the reader has pressed anything, so that Continue feels \
-instant. A step therefore has to stand on its own: never open by referring to what they just \
-clicked, asked or looked at, and never assume which file is in front of them beyond the one you \
-opened yourself.
+Short answers have no parts at all. A question with an answer gets the answer.
 
 4. Begin EVERY reply — without exception, including short answers to questions — with
 
@@ -552,8 +556,6 @@ Use [[say: ...]] sparingly — reformulating the sentence itself is almost alway
 """
 
 
-CONTINUE_PROMPT = "Continue."
-
 INHERITED_NOTE = """
 This conversation is a fork of the terminal session where the user and you designed and built this
 code together, so that history is already above — the decisions, the reasoning, the things you tried
@@ -615,15 +617,6 @@ class Script:
             time.sleep(0.035)
         emit("done", "")
 
-    def prefetch(self, prompt: str, system: str, label: str) -> bool:
-        return False          # nothing to speculate on: the next answer is already written
-
-    def take(self, label: str):
-        return None
-
-    def cancel_pending(self) -> None:
-        pass
-
 
 class Claude:
     """One `claude -p` session over the repo, resumed across turns.
@@ -648,8 +641,6 @@ class Claude:
 
         self.session_id: str | None = None
         self.lock = threading.Lock()
-        self.pending: dict | None = None          # a speculative next turn, or None
-        self.pending_lock = threading.Lock()
 
     @property
     def inherited(self) -> str:
@@ -675,9 +666,6 @@ class Claude:
             argv += ["--resume", self.session_id]
         elif mode == "fork" and self.parent:
             argv += ["--resume", self.parent, "--fork-session"]
-        elif mode == "prefetch" and self.session_id:
-            # Fork, never resume: the canonical session must not be advanced by a guess.
-            argv += ["--resume", self.session_id, "--fork-session"]
         return argv
 
     def ask(self, prompt: str, system: str, emit):
@@ -708,83 +696,13 @@ class Claude:
                     emit("notice", "Could not inherit the terminal session — starting cold.")
             emit("error", "Claude exited without an answer. Check the terminal for details.")
 
-    def prefetch(self, prompt: str, system: str, label: str) -> bool:
-        """Speculatively run the next turn on a fork of the current session.
-
-        The fork is the whole trick: the canonical session is never advanced, so a guess
-        that turns out wrong costs nothing to abandon — there is no state to roll back.
-        """
-        with self.pending_lock:
-            if not self.session_id or self.pending is not None:
-                return False
-            slot = {
-                "label": label, "text": [], "tools": [], "session": None,
-                "done": threading.Event(), "ok": False, "proc": None, "cancelled": False,
-            }
-            self.pending = slot
-
-        def run():
-            cap: dict = {}
-
-            def emit(kind, payload):
-                if kind == "delta":
-                    slot["text"].append(payload)
-                elif kind == "tool":
-                    slot["tools"].append(payload)
-
-            try:
-                ok = self._run(self._argv(prompt, system, "prefetch"), emit, capture=cap, slot=slot)
-            except (OSError, ValueError):
-                ok = False
-            slot["session"] = cap.get("session")
-            slot["ok"] = bool(ok and slot["text"] and slot["session"])
-            slot["done"].set()
-
-        threading.Thread(target=run, daemon=True).start()
-        return True
-
-    def take(self, label: str) -> dict | None:
-        """Claim the speculative turn for `label`, waiting if it is still in flight."""
-        with self.pending_lock:
-            slot = self.pending
-            if slot is None or slot["label"] != label:
-                return None
-            self.pending = None
-        if not slot["done"].wait(timeout=600):
-            slot["cancelled"] = True
-            return None
-        if slot["cancelled"] or not slot["ok"]:
-            return None
-        with self.lock:
-            self.session_id = slot["session"]      # the guess was right: adopt the fork
-        return slot
-
-    def cancel_pending(self) -> None:
-        """Abandon the speculative turn. The canonical session was never touched."""
-        with self.pending_lock:
-            slot, self.pending = self.pending, None
-        if slot is None:
-            return
-        slot["cancelled"] = True
-        proc = slot.get("proc")
-        if proc is not None and proc.poll() is None:
-            try:
-                proc.kill()
-            except OSError:
-                pass
-        slot["done"].set()
-
-    def _run(self, argv, emit, capture: dict | None = None, slot: dict | None = None) -> bool:
+    def _run(self, argv, emit) -> bool:
         proc = subprocess.Popen(
             argv, cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1,
         )
-        if slot is not None:
-            slot["proc"] = proc
         got_text = False
         for raw in proc.stdout:
-            if slot is not None and slot["cancelled"]:
-                return False
             raw = raw.strip()
             if not raw:
                 continue
@@ -795,12 +713,7 @@ class Claude:
             kind = ev.get("type")
 
             if ev.get("session_id"):
-                # A speculative run parks its id in `capture`; only a committed turn
-                # is allowed to move the session the dashboard is actually on.
-                if capture is not None:
-                    capture["session"] = ev["session_id"]
-                else:
-                    self.session_id = ev["session_id"]
+                self.session_id = ev["session_id"]
 
             if kind == "stream_event":
                 inner = ev.get("event", {})
@@ -1125,10 +1038,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/ask":
             b = self._body()
             Handler.voice_on = bool(b.get("voice"))
-            self._ask(b.get("q", ""), b.get("context", ""), b.get("cont") or "")
-        elif path == "/api/prefetch":
-            b = self._body()
-            self._json(self._prefetch(b.get("label") or "", b.get("context", "")))
+            self._ask(b.get("q", ""), b.get("context", ""))
         elif path == "/api/tts":
             b = self._body()
             try:
@@ -1146,14 +1056,8 @@ class Handler(BaseHTTPRequestHandler):
             if want not in Handler.models:
                 self._json({"ok": False, "error": "unknown model"}, 400)
                 return
-            # A guess in flight was made by the old model; it is no longer the answer
-            # this session would give, so drop it rather than serve it later.
-            self.claude.cancel_pending()
             self.claude.model = want
             self._json({"ok": True, "model": want})
-        elif path == "/api/prefetch/cancel":
-            self.claude.cancel_pending()
-            self._json({"ok": True})
         else:
             self._send(404, "text/plain", b"not found")
 
@@ -1179,40 +1083,17 @@ class Handler(BaseHTTPRequestHandler):
             shadow=Handler.shadow.root,
         )
 
-    def _prefetch(self, label: str, context: str) -> dict:
-        """Start speculating on the next Continue. Returns when the guess is ready."""
-        if not label:
-            return {"ok": False}
-        prompt = (context.strip() + "\n\n" + CONTINUE_PROMPT) if context.strip() else CONTINUE_PROMPT
-        if not self.claude.prefetch(prompt, self._system(), label):
-            return {"ok": False}
-        slot = self.claude.pending
-        if slot is None:                    # already claimed or cancelled while we looked
-            return {"ok": True, "ready": True}
-        slot["done"].wait(timeout=600)
-        return {"ok": True, "ready": bool(slot["ok"]) and not slot["cancelled"]}
-
-    def _ask(self, question: str, context: str, cont: str = ""):
+    def _ask(self, question: str, context: str):
         question = (question or "").strip()
         if not question:
             self._json({"error": "empty"}, 400)
             return
-
-        # A Continue we already guessed at is served from the fork; anything else
-        # invalidates the guess, and abandoning it needs no rollback.
-        slot = self.claude.take(cont) if cont else None
-        if slot is None:
-            self.claude.cancel_pending()
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
-
-        if slot is not None:
-            self._replay(question, context, slot)
-            return
 
         prompt = (context.strip() + "\n\n" + question) if context.strip() else question
         system = self._system()
@@ -1242,15 +1123,6 @@ class Handler(BaseHTTPRequestHandler):
             if kind in ("done", "error"):
                 Handler.record(question, context, "".join(answer), tools)
                 return
-
-    def _replay(self, question: str, context: str, slot: dict) -> None:
-        """Deliver an already-finished turn. It lands in one piece, not at typing speed."""
-        text = "".join(slot["text"])
-        for name in slot["tools"]:
-            self._event("tool", name)
-        self._event("delta", text)
-        self._event("done", "")
-        Handler.record(question, context, text, list(slot["tools"]))
 
     def _event(self, kind: str, payload: str) -> None:
         try:
@@ -1381,23 +1253,6 @@ body {
           overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; unicode-bidi: plaintext; }
 .tab .prop { color: var(--hl-rail); font-size: 9px; letter-spacing: 0.06em; margin-left: 4px; }
 .titlebar .center { flex: 1; text-align: center; color: var(--fg-faint); }
-#pftoggle {
-  display: flex; align-items: center; gap: 5px; font-size: 10px; letter-spacing: 0.06em;
-  text-transform: uppercase; color: var(--fg-faint); cursor: pointer; user-select: none;
-}
-#pftoggle:hover { color: var(--fg-dim); }
-#pfon { appearance: none; width: 20px; height: 11px; border-radius: 6px; background: #2d2d2d;
-        position: relative; cursor: pointer; transition: background .15s; margin: 0; }
-#pfon::after { content: ""; position: absolute; top: 2px; left: 2px; width: 7px; height: 7px;
-               border-radius: 50%; background: var(--fg-faint); transition: transform .15s, background .15s; }
-#pfon:checked { background: #2f4f36; }
-#pfon:checked::after { transform: translateX(9px); background: var(--green); }
-/* The only motion is a slow fade on a 5px dot — visible if looked for, ignorable if not. */
-#pfdot { width: 5px; height: 5px; border-radius: 50%; background: transparent; transition: background .2s; }
-#pfdot.run { background: var(--fg-faint); animation: pfpulse 1.6s ease-in-out infinite; }
-#pfdot.ready { background: var(--green); }
-@keyframes pfpulse { 0%, 100% { opacity: 0.25; } 50% { opacity: 0.9; } }
-@media (prefers-reduced-motion: reduce) { #pfdot.run { animation: none; opacity: 0.6; } }
 
 .main { flex: 1 1 auto; display: flex; min-height: 0; }
 .pane { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
@@ -1606,9 +1461,6 @@ textarea:focus { outline: none; border-color: var(--accent); }
 <div class="titlebar">
   <span class="brand">codewalk</span>
   <span class="center" id="titleRoot">—</span>
-  <label id="pftoggle" title="Prefetch the next step while you read, so Continue is instant">
-    <input type="checkbox" id="pfon"><span>prefetch</span><i id="pfdot"></i>
-  </label>
   <span id="syncbar" hidden><button id="syncNow">Sync to terminal</button><button id="syncClose" class="ghost">Sync &amp; close</button></span>
   <button id="handback" hidden>Return to terminal</button>
 </div>
@@ -2137,15 +1989,39 @@ textarea:focus { outline: none; border-color: var(--accent); }
   // ---------------- reply rendering ----------------
   const OPEN_RE = /\[\[open:\s*([^\]|:]+?)\s*(?::\s*([\d,\s-]+?))?\s*(?:\|\s*([^\]]*?)\s*)?\]\]/g;
   const EDIT_RE = /\[\[edit:\s*([^\]|:]+?)\s*:\s*(\d+)\s*-\s*(\d+)\s*\]\]\n?([\s\S]*?)\[\[\/edit\]\]/g;
-  const CONT_RE = /\[\[continue(?::\s*([^\]]*?))?\s*\]\]/;
   // The spoken form of a sentence that had to be written in symbols. It never shows in
   // the chat; the narrator swaps it in for the sentence it follows.
   const SAY_RE = /\[\[say:\s*([\s\S]*?)\]\]/g;
+  // The same directive, used to cut one answer into the parts a reader walks through.
+  const CONT_G = /\[\[continue(?::\s*([^\]]*?))?\s*\]\]/g;   // a part break
+
+  // Every [[continue:]] in the text, as {at, end, label}.
+  function breaks(text) {
+    const out = [];
+    let m;
+    CONT_G.lastIndex = 0;
+    while ((m = CONT_G.exec(text))) {
+      out.push({ at: m.index, end: m.index + m[0].length, label: (m[1] || "").trim() });
+    }
+    return out;
+  }
+
+  // The first `n` parts of an answer, as one piece of text.
+  function revealed(text, n) {
+    const bs = breaks(text);
+    return n > bs.length ? text : text.slice(0, bs[n - 1].at);
+  }
+
+  // The label on the button that reveals part n+1, or null when there is no more.
+  function breakLabel(text, n) {
+    const bs = breaks(text);
+    return n <= bs.length ? bs[n - 1].label : null;
+  }
   const TITLE_RE = /\[\[title:\s*([^\]]*?)\s*\]\]/;
 
   function renderReply(el, text) {
     el.textContent = "";
-    text = text.replace(CONT_RE, "").replace(TITLE_RE, "")    // control signals, not prose
+    text = text.replace(CONT_G, "").replace(TITLE_RE, "")     // control signals, not prose
                .replace(SAY_RE, "");
     let cursor = 0, m;
     EDIT_RE.lastIndex = 0;
@@ -2573,63 +2449,10 @@ textarea:focus { outline: none; border-color: var(--accent); }
     updateJump();
   }
 
-  // ---------------- prefetch ----------------
-  // Speculate on the next Continue while the user reads. The server runs it on a fork,
-  // so if they type something else instead the guess is simply dropped — there is no
-  // state to unwind, and the user is never told any of this happened.
-  let pfOn = false, pfLabel = null, pfReady = false;
-
-  function viewContext() {
-    const t = tab(active);
-    if (!t) return "";
-    let c = "[The user is looking at " + t.path;
-    if (t.sel) c += ", lines " + t.sel.a + "-" + t.sel.b + " selected";
-    return c + ".]";
-  }
-
-  function pfDot(state) {
-    const d = $("pfdot");
-    d.className = state || "";
-  }
-
-  function pfCancel() {
-    pfLabel = null; pfReady = false; pfDot("");
-    fetch("/api/prefetch/cancel", { method: "POST" }).catch(() => {});
-  }
-
-  async function pfStart(label, context) {
-    if (!pfOn || !label) return;
-    pfLabel = label; pfReady = false; pfDot("run");
-    let res = null;
-    try {
-      res = await fetch("/api/prefetch", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ label: label, context: context }),
-      }).then((r) => r.json());
-    } catch (e) { res = null; }
-    if (pfLabel !== label) return;              // superseded while in flight
-    pfReady = !!(res && res.ok && res.ready);
-    pfDot(pfReady ? "ready" : "");
-  }
-
-  function setupPrefetch() {
-    const box = $("pfon");
-    try { pfOn = localStorage.getItem("codewalk.prefetch") === "1"; } catch (e) { pfOn = false; }
-    box.checked = pfOn;
-    box.onchange = () => {
-      pfOn = box.checked;
-      try { localStorage.setItem("codewalk.prefetch", pfOn ? "1" : "0"); } catch (e) {}
-      if (!pfOn) pfCancel();
-      else {
-        // Turned on mid-conversation: speculate on the Continue already on screen.
-        const btn = logEl.querySelector(".contbar .contbtn");
-        if (btn && btn.dataset.label !== undefined && !busy) pfStart(btn.dataset.label, viewContext());
-      }
-    };
-  }
-
-  // A step ends with [[continue: ...]]; this is the button that asks for the next one.
-  function addContinue(msg, label) {
+  // The answer arrives whole, split into parts by [[continue: ...]]. The button walks
+  // through what is already written -- no second call, nothing to guess, and the reader
+  // sets the pace instead of the model.
+  function addContinue(msg, label, onclick) {
     const bar = document.createElement("div");
     bar.className = "contbar";
     const btn = document.createElement("button");
@@ -2644,7 +2467,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
       btn.appendChild(nx);
     }
     btn.dataset.label = label || "";
-    btn.onclick = () => ask("Continue.", label || "");
+    btn.onclick = onclick;
     const hint = document.createElement("span");
     hint.className = "kbd";
     hint.textContent = "or press Enter";
@@ -2661,10 +2484,6 @@ textarea:focus { outline: none; border-color: var(--accent); }
     const w = msg.querySelector(".who");
     w.textContent = title;
     w.classList.add("titled");
-  }
-
-  function retireContinues() {
-    logEl.querySelectorAll(".contbar").forEach((b) => b.remove());
   }
 
   function pendingContinue() {
@@ -2992,7 +2811,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
   // sentence-final intonation and a pause, so "the primary path, with" landed like a
   // finished sentence and the label after it started a new one.
   function narrChunks(text, scope) {
-    text = text.replace(CONT_RE, "").replace(TITLE_RE, "");
+    text = text.replace(CONT_G, "").replace(TITLE_RE, "");
     text = text.replace(EDIT_RE, (m, p) => " Proposing an edit to " + shortPath(p) + ". ");
     text = text.replace(FENCE_RE, " (code block in the chat.) ");
 
@@ -3109,7 +2928,6 @@ textarea:focus { outline: none; border-color: var(--accent); }
     modelEl.value = cur || "";
     modelEl.onchange = async () => {
       const want = modelEl.value;
-      pfCancel();                 // the guess in flight came from the old model
       try {
         const r = await fetch("/api/model", {
           method: "POST", headers: { "Content-Type": "application/json" },
@@ -3184,17 +3002,11 @@ textarea:focus { outline: none; border-color: var(--accent); }
   });
   setVoiceBtn();
 
-  async function ask(text, cont) {
+  async function ask(text) {
     if (busy) return;
     const q = (text || "").trim();
     if (!q) return;
 
-    // Claim the guess only if it is for this exact step; otherwise drop it.
-    const claim = (cont && pfLabel === cont) ? cont : "";
-    if (!claim) pfCancel(); else pfDot("");
-    pfLabel = null; pfReady = false;
-
-    retireContinues();
     narrStop();
     const t = tab(active);
     const sent = refs.slice();
@@ -3238,13 +3050,43 @@ textarea:focus { outline: none; border-color: var(--accent); }
     syncCellNav();
     updateJump();
 
-    let acc = "", autoIdx = -1, nextPrefetch = null;
+    let acc = "", autoIdx = -1;
     const narr = { raw: "", el: out, sent: 0 };
+
+    // How much of the answer the reader has asked for. Everything past the current
+    // [[continue:]] is written but not shown, not spoken, and not allowed to move the
+    // pane: the model finishes its thought, the reader walks through it.
+    let shown = 1;
+    const show = () => {
+      const text = revealed(acc, shown);
+      const label = breakLabel(acc, shown);
+      renderReply(out, text);
+      msg.querySelectorAll(".contbar").forEach((b) => b.remove());
+      if (label !== null) {
+        addContinue(msg, label, () => {
+          shown += 1;
+          msg.dataset.shown = String(shown);
+          show();
+          applyPin();
+        });
+      }
+      // A part followed by a break is finished even while the rest still streams, so
+      // the narrator may speak all of it; only the tail of the last part has to wait.
+      narrFeed(narr, text, out, label !== null || !busy);
+      if (!narrOn) {
+        const ds = allDirectives(text);
+        if (follow && ds.length - 1 > autoIdx) {
+          autoIdx = ds.length - 1;
+          openFile(ds[autoIdx].path, ds[autoIdx].spec);
+        }
+        markActiveChip(out, autoIdx);
+      }
+    };
 
     try {
       const res = await fetch("/api/ask", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ q: q, context: context, cont: claim, voice: narrOn }),
+        body: JSON.stringify({ q: q, context: context, voice: narrOn }),
       });
       const reader = res.body.getReader();
       const dec = new TextDecoder();
@@ -3263,14 +3105,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
             acc += ev.v;
             const tm = TITLE_RE.exec(acc);
             if (tm) setCellTitle(msg, (tm[1] || "").trim());
-            renderReply(out, acc);
-            narrFeed(narr, acc, out, false);
-            const ds = allDirectives(acc);
-            if (follow && !narrOn && ds.length - 1 > autoIdx) {
-              autoIdx = ds.length - 1;
-              openFile(ds[autoIdx].path, ds[autoIdx].spec);
-            }
-            if (!narrOn) markActiveChip(out, autoIdx);
+            show();
           } else if (ev.k === "tool") {
             const a = document.createElement("div");
             a.className = "act"; a.textContent = ev.v;
@@ -3293,23 +3128,17 @@ textarea:focus { outline: none; border-color: var(--accent); }
       if (acc) {
         const tm = TITLE_RE.exec(acc);
         if (tm) setCellTitle(msg, (tm[1] || "").trim());
-        renderReply(out, acc);
-        const cont = CONT_RE.exec(acc);
-        if (cont) {
-          const label = (cont[1] || "").trim();
-          addContinue(msg, label);
-          nextPrefetch = label;
-        }
         msg.dataset.raw = acc;
+        msg.dataset.shown = "1";
         addReplay(acts, msg, out);
-        narrFeed(narr, acc, out, true);
-        const ds = allDirectives(acc);
-        if (!narrOn) {
-          if (ds.length && autoIdx < 0) {
+        show();
+        if (!narrOn && autoIdx < 0) {
+          const ds = allDirectives(revealed(acc, shown));
+          if (ds.length) {
             autoIdx = 0;
             openFile(ds[0].path, ds[0].spec);
+            markActiveChip(out, autoIdx);
           }
-          markActiveChip(out, autoIdx);
         }
       }
     } catch (err) {
@@ -3323,9 +3152,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
       releasePin();
       syncCellNav();
       updateJump();
-      // Start guessing only once this turn is fully done, so the speculative fork
-      // inherits a complete session rather than a half-written one.
-      if (nextPrefetch !== null) pfStart(nextPrefetch, viewContext());
+      show();               // the last part is complete now: release it to the narrator
       refreshProposals();   // the agent may have drafted a file this turn
     }
   }
@@ -3442,7 +3269,6 @@ textarea:focus { outline: none; border-color: var(--accent); }
     setVoiceBtn();
     setupModel(d.model, d.models);
     setupProposals();
-    setupPrefetch();
     if (d.sync) setupSync();
     renderTree();
     const b = bubble("Claude").querySelector(".body");
