@@ -38,7 +38,7 @@ function narrEnqueue(items) { for (const it of items) spoken.push(it); }
 // A direct eval keeps its const/let to itself, so the pieces the test needs are
 // handed back out explicitly. The point is to run the page's own code, not a copy.
 const F = {};
-eval(core + "\nObject.assign(F, {CONT_RE, TITLE_RE, EDIT_RE, FENCE_RE, OPEN_RE, narrFeed, narrClean});");
+eval(core + "\nObject.assign(F, {CONT_RE, TITLE_RE, EDIT_RE, FENCE_RE, OPEN_RE, SAY_RE, narrFeed, narrClean, unitStart});");
 
 
 // Written for the eye, said for the ear.
@@ -68,6 +68,20 @@ const turns = demo.replace(/^(?:#[^\n]*\n|\s*\n)+/, "").split(/^===[^\n]*\n/m)
                   .map((t) => t.trim()).filter(Boolean);
 if (process.argv[2]) turns.push(...JSON.parse(fs.readFileSync(process.argv[2], "utf8")));
 
+// [[say: ...]] stands in for the sentence it follows, so the expectation must too.
+function applySay(t) {
+  let out = t, m;
+  const re = new RegExp(F.SAY_RE.source, "g");
+  while ((m = re.exec(out))) {
+    let from = F.unitStart(out, m.index);
+    if (!out.slice(from, m.index).trim() && from > 0) from = F.unitStart(out, from - 1);
+    const said = " " + m[1].trim() + " ";
+    out = out.slice(0, from) + said + out.slice(m.index + m[0].length);
+    re.lastIndex = from + said.length;
+  }
+  return out;
+}
+
 const norm = (t) => t.replace(/\s+([,.;:!?])/g, "$1").replace(/[\s,]+/g, " ").trim();
 let bad = 0;
 
@@ -83,7 +97,7 @@ turns.forEach((turn, n) => {
 
   const said = spoken.map((c) => c.say).filter(Boolean).join(" ");
   const want = F.narrClean(
-    turn.replace(F.CONT_RE, "").replace(F.TITLE_RE, "").replace(F.EDIT_RE, " ")
+    applySay(turn).replace(F.CONT_RE, "").replace(F.TITLE_RE, "").replace(F.EDIT_RE, " ")
         .replace(F.FENCE_RE, " ")
         .replace(F.OPEN_RE, (m, p, spec, label) => (label ? " " + label + " " : " ")),
   );

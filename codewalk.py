@@ -511,16 +511,38 @@ context.
 
 
 VOICE_NOTE = """
-The user is LISTENING to this answer, not reading it: it is being spoken aloud while they watch the
-code pane. Write prose that survives being heard.
+THE USER IS LISTENING TO THIS ANSWER. Every word you write is spoken aloud by a synthetic voice
+while they watch the code pane. You are not writing text that happens to be read out — you are
+TALKING to someone who cannot see your sentence and cannot go back over it.
 
-Say things in words rather than symbols. A shape is "batch by variates by model width", not
-"(bv, n+v, d)"; a condition is "at least one", not ">= 1". Where the exact symbols are the point,
-put them on the screen instead — point at the line with [[open:...]] and describe in words what it
-says. Identifiers are fine to name, but a sentence that is mostly punctuation is unlistenable.
+This changes how you write, not just which words you pick. Say a thing the way you would say it to
+a colleague sitting next to you, out loud, with no whiteboard.
 
-Keep sentences short enough to follow without a second reading, and put the subject early. Avoid
-parentheses inside sentences: a spoken aside has no brackets, so fold it into its own sentence.
+Never write a shape, signature or expression in symbols. Say what it IS:
+
+  BAD:  inputs arrive as batch by variates by num_patches by patch_length (bvnp)
+  GOOD: inputs arrive as a four dimensional tensor: batch, variate, patch number, and patch length
+
+  BAD:  it reshapes (b v n d) to (b*n, v, d) and applies attention over v
+  GOOD: it folds the patch axis into the batch axis, so attention runs across variates
+
+  BAD:  a single full attention over (bv, n+v, d) would be quadratic
+  GOOD: attending over sequence and variates at once would cost the square of both together
+
+The precision belongs on the screen, not in the ear: point at the line with [[open:...]] and say in
+words what it does. They can read the exact shape there while you talk.
+
+Also: short sentences, subject first, no parentheses mid-sentence — a spoken aside has no brackets,
+so make it its own sentence. No lists of symbols. No abbreviations they would have to unpack, like
+"bvnp" or "MHA"; say the words.
+
+When a sentence really must be written with symbols for the screen, put the spoken version after it
+in a [[say: ...]] directive, and that is what will be read aloud in place of that sentence:
+
+  The mixing transformer runs `(b*n, v, d)` attention separately. [[say: the mixing transformer
+  runs attention across variates separately, with the patch axis folded into the batch.]]
+
+Use [[say: ...]] sparingly — reformulating the sentence itself is almost always better.
 """
 
 
@@ -2114,11 +2136,15 @@ textarea:focus { outline: none; border-color: var(--accent); }
   const OPEN_RE = /\[\[open:\s*([^\]|:]+?)\s*(?::\s*([\d,\s-]+?))?\s*(?:\|\s*([^\]]*?)\s*)?\]\]/g;
   const EDIT_RE = /\[\[edit:\s*([^\]|:]+?)\s*:\s*(\d+)\s*-\s*(\d+)\s*\]\]\n?([\s\S]*?)\[\[\/edit\]\]/g;
   const CONT_RE = /\[\[continue(?::\s*([^\]]*?))?\s*\]\]/;
+  // The spoken form of a sentence that had to be written in symbols. It never shows in
+  // the chat; the narrator swaps it in for the sentence it follows.
+  const SAY_RE = /\[\[say:\s*([\s\S]*?)\]\]/g;
   const TITLE_RE = /\[\[title:\s*([^\]]*?)\s*\]\]/;
 
   function renderReply(el, text) {
     el.textContent = "";
-    text = text.replace(CONT_RE, "").replace(TITLE_RE, "");   // control signals, not prose
+    text = text.replace(CONT_RE, "").replace(TITLE_RE, "")    // control signals, not prose
+               .replace(SAY_RE, "");
     let cursor = 0, m;
     EDIT_RE.lastIndex = 0;
     while ((m = EDIT_RE.exec(text))) {
@@ -2860,6 +2886,14 @@ textarea:focus { outline: none; border-color: var(--accent); }
     return out;
   }
 
+  // The start of the unit that contains `at`.
+  function unitStart(text, at) {
+    let start = 0, m;
+    UNIT_END.lastIndex = 0;
+    while ((m = UNIT_END.exec(text)) && UNIT_END.lastIndex <= at) start = UNIT_END.lastIndex;
+    return start;
+  }
+
   // Where it is safe to stop reading a half-written answer: the end of the last
   // complete unit, never inside an unfinished fence, edit block or directive.
   function narrStable(text) {
@@ -2888,6 +2922,19 @@ textarea:focus { outline: none; border-color: var(--accent); }
       const open = trimmed.lastIndexOf("[[");
       if (open !== -1) stable = stable.slice(0, open);
     }
+    // A sentence followed by [[say: ...]] must never be spoken in its written form.
+    // The directive sits after the full stop, so it falls outside the prefix that ends
+    // there: take it in when it is complete, and wait when it might still be coming.
+    const rawRest = text.slice(stable.length);
+    const rest = rawRest.replace(/^\s+/, "");
+    const gap = rawRest.length - rest.length;
+    const dropLast = () => stable.slice(0, unitStart(stable, stable.length - 1));
+    if (rest.startsWith("[[say:")) {
+      const close = rest.indexOf("]]");
+      return close === -1 ? dropLast() : text.slice(0, stable.length + gap + close + 2);
+    }
+    // Nothing yet, or only the few characters that could still become "[[say:".
+    if (rest === "" || /^(\[(\[(s(a(y(:)?)?)?)?)?)$/.test(rest)) return dropLast();
     return stable;
   }
 
@@ -2962,6 +3009,26 @@ textarea:focus { outline: none; border-color: var(--accent); }
       last = m.index + m[0].length;
     }
     prose += text.slice(last);
+
+    // [[say: ...]] replaces the sentence it follows, in the ear only. Chips inside
+    // that sentence keep their place by moving to the start of the spoken version --
+    // the words no longer line up, but the code they point at still does.
+    SAY_RE.lastIndex = 0;
+    let sm;
+    while ((sm = SAY_RE.exec(prose))) {
+      // The directive usually comes after the sentence's full stop, which puts it in a
+      // unit of its own; the sentence it replaces is then the one before.
+      let from = unitStart(prose, sm.index);
+      if (!prose.slice(from, sm.index).trim() && from > 0) from = unitStart(prose, from - 1);
+      const said = " " + sm[1].trim() + " ";
+      const delta = said.length - (sm.index + sm[0].length - from);
+      for (const k of marks) {
+        if (k.at >= from && k.at < sm.index + sm[0].length) k.at = from;
+        else if (k.at >= sm.index + sm[0].length) k.at += delta;
+      }
+      prose = prose.slice(0, from) + said + prose.slice(sm.index + sm[0].length);
+      SAY_RE.lastIndex = from + said.length;
+    }
 
     const fireFor = (i) => () => {
       const ds = allDirectives(scope.raw || "");

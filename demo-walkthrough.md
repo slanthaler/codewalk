@@ -87,3 +87,15 @@ in one streaming pass and part of the next chunk in the pass after it. Writing t
 as `[[open:codewalk.py:1-5]]` inside backticks stays quoted: it is code, not a chip.
 
 [[continue: whatever you want to poke at]]
+
+=== a sentence written for the eye and said for the ear
+The transformer stack folds the patch axis into the batch axis before attending across variates,
+which on screen is written `(b*n, v, d)`. [[say: the transformer stack folds the patch axis into
+the batch axis before attending across variates.]]
+
+Shapes are the usual case: a tensor of `(batch, variates, patches, patch_length)` is four
+dimensional, and the voice says it as batch by variates by patches by patch length, which is why
+the written form stays on screen where it can be read [[open:codewalk.py:363-400|tokenize, for
+contrast, needs no shapes at all]].
+
+[[continue: whatever you want to poke at]]
