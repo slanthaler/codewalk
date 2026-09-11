@@ -1374,6 +1374,7 @@ body {
 .iconbtn:hover:not(:disabled) { color: var(--fg-dim); background: var(--bg-hover); }
 .iconbtn:disabled { opacity: 0.4; cursor: default; }
 select.iconbtn { padding: 2px 4px; text-transform: none; letter-spacing: 0; }
+.iconbtn.wants { color: var(--hl-rail); border-color: var(--hl-rail); }
 .rateWrap { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--fg-faint); }
 .rateWrap input { width: 74px; accent-color: var(--hl-rail); cursor: pointer; }
 .rateWrap #rateVal { font-family: var(--mono); min-width: 34px; text-align: right; }
@@ -2648,6 +2649,22 @@ textarea:focus { outline: none; border-color: var(--accent); }
   const audioEl = new Audio();
   const AHEAD = 3;
 
+  // Chrome refuses audio.play() until the page has been clicked, and a reload with
+  // Voice already on has no click yet. The old speechSynthesis path was never gated
+  // this way, so this has to be handled rather than assumed: a refusal must not eat
+  // the sentence -- it goes back on the queue and waits for the first gesture.
+  let narrBlocked = false;
+  function narrUnblock() {
+    if (!narrBlocked) return;
+    narrBlocked = false;
+    voiceBtn.classList.remove("wants");
+    setVoiceBtn();
+    narrPump();
+  }
+  for (const ev of ["pointerdown", "keydown"]) {
+    document.addEventListener(ev, narrUnblock, true);
+  }
+
   function narrDrop(it) {
     if (it.ctrl) { try { it.ctrl.abort(); } catch (e) {} }
     if (it.url) { URL.revokeObjectURL(it.url); it.url = null; }
@@ -2696,9 +2713,9 @@ textarea:focus { outline: none; border-color: var(--accent); }
   }
 
   function narrPump() {
-    if (narrBusy || !narrQ.length) return;
+    if (narrBusy || narrBlocked || !narrQ.length) return;
     const it = narrQ.shift();
-    if (it.fire) it.fire();
+    if (it.fire && !it.fired) { it.fire(); it.fired = true; }
     if (!it.say) { narrPump(); return; }
     narrBusy = true;
     narrCurrent = it;
@@ -2722,7 +2739,21 @@ textarea:focus { outline: none; border-color: var(--accent); }
         audioEl.playbackRate = 1;
         audioEl.onended = next;
         audioEl.onerror = next;
-        audioEl.play().catch(next);
+        audioEl.play().catch((err) => {
+          if (tok !== narrToken) return;
+          if (err && err.name === "NotAllowedError") {
+            narrQ.unshift(it);          // hold the sentence, do not skip it
+            it.fired = true;            // its chip is already lit; do not fire twice
+            narrBusy = false;
+            narrCurrent = null;
+            narrBlocked = true;
+            voiceBtn.classList.add("wants");
+            setVoiceBtn();
+            flash("click the page to start the voice");
+            return;
+          }
+          next();
+        });
       });
       return;
     }
@@ -2830,7 +2861,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
         // The prose after a chip often starts with its own comma; two in a row makes
         // Piper pause twice.
         const say = pendingLabel
-          ? pendingLabel + (/^[,.;:!?]/.test(rest) ? "" : ",") + " " + rest
+          ? pendingLabel + (/^[,.;:!?]/.test(rest) ? "" : ", ") + rest
           : rest;
         pendingLabel = "";
         out.push({ say: say, idx: i });
@@ -2910,9 +2941,20 @@ textarea:focus { outline: none; border-color: var(--accent); }
     };
   }
 
+  // A test hook: the page is one closure, so an automated check of the narrator has
+  // no other way to see whether a sentence was held or dropped.
+  window.__cw = {
+    narr: () => ({
+      on: narrOn, blocked: narrBlocked, busy: narrBusy, queued: narrQ.length,
+      rate: narrRate, tts: ttsOK, playing: !audioEl.paused,
+      at: audioEl.currentTime, say: narrCurrent ? narrCurrent.say : null,
+    }),
+  };
+
   const voiceBtn = $("voice"), rateEl = $("rate"), rateWrap = $("rateWrap");
   function setVoiceBtn() {
-    voiceBtn.textContent = "Voice: " + (narrOn ? "on" : "off");
+    voiceBtn.textContent = narrBlocked ? "Voice: click to start"
+                                       : "Voice: " + (narrOn ? "on" : "off");
     voiceBtn.style.color = narrOn ? "var(--hl-rail)" : "";
     rateWrap.hidden = !narrOn;
     rateEl.value = String(narrRate);
@@ -2920,6 +2962,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
   }
 
   voiceBtn.onclick = () => {
+    narrUnblock();
     narrOn = !narrOn;
     localStorage.setItem("cw.voice", narrOn ? "1" : "0");
     if (!narrOn) narrStop();
