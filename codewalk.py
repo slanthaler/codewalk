@@ -1277,6 +1277,10 @@ body {
 .acts { margin-bottom: 8px; display: flex; flex-direction: column; gap: 2px; }
 .act { font-family: var(--mono); font-size: 11px; color: var(--fg-faint); display: flex; gap: 6px; }
 .act::before { content: "\203A"; color: var(--green); }
+.act.replay { align-self: flex-start; cursor: pointer; background: none; border: 0; padding: 0;
+              color: var(--fg-faint); }
+.act.replay::before { content: none; }
+.act.replay:hover { color: var(--hl-rail); }
 .thinking { color: var(--fg-faint); font-style: italic; }
 .thinking::after { content: ""; animation: dots 1.4s steps(4, end) infinite; }
 @keyframes dots { 0% { content: ""; } 25% { content: "."; } 50% { content: ".."; } 75% { content: "..."; } }
@@ -1391,7 +1395,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
   <div class="sash" id="sash2" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize chat"></div>
 
   <section class="pane" id="chat">
-    <div class="paneHead"><span>Walkthrough</span><span class="spacer"></span><button class="iconbtn" id="follow" title="Let Claude move the editor as it explains">Follow: on</button><button class="iconbtn" id="clearHl" disabled>Clear highlight</button><button class="iconbtn" id="cellPrev" title="Previous step (Alt+Up)" disabled>&#8593;</button><button class="iconbtn" id="cellNext" title="Next step (Alt+Down)" disabled>&#8595;</button></div>
+    <div class="paneHead"><span>Walkthrough</span><span class="spacer"></span><button class="iconbtn" id="voice" title="Read the walkthrough aloud and move the editor in time with the voice">Voice: off</button><button class="iconbtn" id="rate" title="Speaking speed" hidden>1.05×</button><button class="iconbtn" id="follow" title="Let Claude move the editor as it explains">Follow: on</button><button class="iconbtn" id="clearHl" disabled>Clear highlight</button><button class="iconbtn" id="cellPrev" title="Previous step (Alt+Up)" disabled>&#8593;</button><button class="iconbtn" id="cellNext" title="Next step (Alt+Down)" disabled>&#8595;</button></div>
     <div id="logwrap">
       <button id="jumpDown" hidden title="Jump to the latest step">&#8595; latest</button>
       <div id="log"><div id="tailpad"></div></div>
@@ -2400,6 +2404,214 @@ textarea:focus { outline: none; border-color: var(--accent); }
     $("stState").textContent = label || (on ? "thinking" : "ready");
   }
 
+  // ---------------- narration ----------------
+  // The chat is read aloud while the center pane follows the voice, not the stream:
+  // an [[open:...]] fires the moment speech reaches the spot in the sentence where it
+  // was written, which is how a person points at code while talking about it.
+  const synth = window.speechSynthesis || null;
+  let narrOn = synth && localStorage.getItem("cw.voice") === "1";
+  let narrRate = Number(localStorage.getItem("cw.rate") || 1.05);
+  let narrVoice = null;
+  let narrQ = [];          // queued {say, fire, idx, scope}
+  let narrBusy = false;
+  let narrToken = 0;       // bumped on every stop; stale callbacks check it
+
+  // Chrome stops speaking after ~15s of one utterance unless it is nudged.
+  if (synth) setInterval(() => {
+    if (narrBusy && synth.speaking && !synth.paused) { synth.pause(); synth.resume(); }
+  }, 8000);
+
+  const VOICE_RANK = ["ryan", "lessac", "piper", "google us english", "microsoft aria", "samantha",
+                      "english (america)", "en-us", "english"];
+  function pickVoice() {
+    if (!synth) return;
+    const vs = synth.getVoices().filter((v) => /^en/i.test(v.lang));
+    if (!vs.length) return;
+    const want = localStorage.getItem("cw.voiceName");
+    narrVoice = vs.find((v) => v.name === want) ||
+      VOICE_RANK.map((k) => vs.find((v) => (v.name + " " + v.lang).toLowerCase().includes(k)))
+                .find(Boolean) || vs[0];
+  }
+  if (synth) { pickVoice(); synth.onvoiceschanged = pickVoice; }
+
+  function narrStop() {
+    narrToken++;
+    narrQ = [];
+    narrBusy = false;
+    if (synth) synth.cancel();
+  }
+
+  function narrEnqueue(items) {
+    if (!narrOn || !items.length) return;
+    for (const it of items) narrQ.push(it);
+    narrPump();
+  }
+
+  function narrPump() {
+    if (narrBusy || !narrQ.length || !synth) return;
+    const it = narrQ.shift();
+    if (it.fire) it.fire();
+    if (!it.say) { narrPump(); return; }
+    const tok = narrToken;
+    const u = new SpeechSynthesisUtterance(it.say);
+    if (narrVoice) { u.voice = narrVoice; u.lang = narrVoice.lang; }
+    u.rate = narrRate;
+    narrBusy = true;
+    const next = () => {
+      if (tok !== narrToken) return;     // a stop happened while we were talking
+      narrBusy = false;
+      narrPump();
+    };
+    u.onend = next;
+    u.onerror = next;
+    synth.speak(u);
+  }
+
+  // Where it is safe to stop reading a half-written answer: the last sentence or
+  // paragraph break, never inside an unfinished fence, edit block or directive.
+  function narrStable(text) {
+    let cut = text.length;
+    for (const open of ["```", "[[edit:"]) {
+      const i = text.lastIndexOf(open);
+      if (i !== -1) {
+        const close = open === "```" ? text.indexOf("```", i + 3) : text.indexOf("[[/edit]]", i);
+        if (close === -1) cut = Math.min(cut, i);
+      }
+    }
+    const bracket = text.lastIndexOf("[[");
+    if (bracket !== -1 && text.indexOf("]]", bracket) === -1) cut = Math.min(cut, bracket);
+    const head = text.slice(0, cut);
+    const m = head.match(/^[\s\S]*(?:[.!?:;][)"'”]?\s|\n\n)/);
+    return m ? m[0] : "";
+  }
+
+  const NARR_DROP = /\[\[[^\]]*\]\]/g;
+  function narrClean(s) {
+    return s.replace(NARR_DROP, " ")
+            .replace(/`([^`\n]+)`/g, "$1")
+            .replace(/\*\*([^*\n]+)\*\*/g, "$1")
+            .replace(/\*([^*\n]+)\*/g, "$1")
+            .replace(/\s+/g, " ")
+            .trim();
+  }
+
+  // Split the answer into speakable chunks, each optionally carrying the index of the
+  // [[open:...]] chip that should light up the instant that chunk starts.
+  function narrChunks(text, scope) {
+    text = text.replace(CONT_RE, "").replace(TITLE_RE, "");
+    text = text.replace(EDIT_RE, (m, p) => " Proposing an edit to " + shortPath(p) + ". ");
+    text = text.replace(FENCE_RE, " (code block in the chat.) ");
+
+    const codeSpans = [];
+    let cm; const CODE_RE = /`[^`\n]+`/g;
+    while ((cm = CODE_RE.exec(text))) codeSpans.push([cm.index, cm.index + cm[0].length]);
+    const inCode = (i) => codeSpans.some(([a, b]) => i >= a && i < b);
+
+    const parts = [];            // {say, idx}  idx = chip to activate when it starts
+    let last = 0, idx = 0, pendingIdx = null, m;
+    OPEN_RE.lastIndex = 0;
+    while ((m = OPEN_RE.exec(text))) {
+      if (!isPath(m[1]) || inCode(m.index)) continue;
+      parts.push({ say: narrClean(text.slice(last, m.index)), idx: pendingIdx });
+      pendingIdx = idx++;
+      last = m.index + m[0].length;
+    }
+    parts.push({ say: narrClean(text.slice(last)), idx: pendingIdx });
+
+    // Long chunks become one utterance per sentence so the voice stays interruptible
+    // and Chrome never truncates; only the first sentence carries the chip.
+    const out = [];
+    let carry = null;
+    for (const p of parts) {
+      let i = p.idx === null ? carry : p.idx;
+      if (!p.say) { carry = i; continue; }
+      carry = null;
+      const sents = p.say.match(/[^.!?]+[.!?]+[)"'”]?\s*|[^.!?]+$/g) || [p.say];
+      let buf = "";
+      const flush = () => {
+        if (!buf.trim()) return;
+        out.push({ say: buf.trim(), idx: i });
+        i = null; buf = "";
+      };
+      for (const s of sents) {
+        if ((buf + s).length > 260) flush();
+        buf += s;
+      }
+      flush();
+    }
+    if (carry !== null) out.push({ say: "", idx: carry });
+    return out.map((c) => ({
+      say: c.say,
+      idx: c.idx,
+      fire: c.idx === null ? null : () => {
+        const ds = allDirectives(scope.raw || "");
+        const d = ds[c.idx];
+        if (d) openFile(d.path, d.spec);
+        if (scope.el) markActiveChip(scope.el, c.idx);
+      },
+    }));
+  }
+
+  // Every finished answer keeps its raw text, so it can be read aloud again later.
+  function addReplay(acts, msg, out) {
+    if (!synth || acts.querySelector(".replay")) return;
+    const b = document.createElement("button");
+    b.className = "act replay";
+    b.title = "Read this step aloud";
+    b.textContent = "\u25b6 listen";
+    b.onclick = () => narrReplay(out, msg.dataset.raw || "");
+    acts.appendChild(b);
+  }
+
+  // A live answer: feed whatever has become stable since the last call.
+  function narrFeed(state, acc, el, final) {
+    if (!narrOn) return;
+    state.raw = acc;
+    state.el = el;
+    const src = final ? acc : narrStable(acc);
+    if (!src) return;
+    const chunks = narrChunks(src, state);
+    if (chunks.length <= state.sent) return;
+    narrEnqueue(chunks.slice(state.sent));
+    state.sent = chunks.length;
+  }
+
+  function narrReplay(el, raw) {
+    narrStop();
+    if (!synth) return;
+    const state = { raw: raw, el: el, sent: 0 };
+    narrOn = true; setVoiceBtn();
+    narrEnqueue(narrChunks(raw, state));
+  }
+
+  const voiceBtn = $("voice"), rateBtn = $("rate");
+  function setVoiceBtn() {
+    voiceBtn.textContent = "Voice: " + (narrOn ? "on" : "off");
+    voiceBtn.style.color = narrOn ? "var(--hl-rail)" : "";
+    rateBtn.hidden = !narrOn;
+    rateBtn.textContent = narrRate.toFixed(2).replace(/0$/, "") + "×";
+  }
+  if (!synth) voiceBtn.hidden = true;
+  voiceBtn.onclick = () => {
+    narrOn = !narrOn;
+    localStorage.setItem("cw.voice", narrOn ? "1" : "0");
+    if (!narrOn) narrStop();
+    setVoiceBtn();
+  };
+  const RATES = [0.9, 1.05, 1.2, 1.4, 1.6];
+  rateBtn.onclick = () => {
+    narrRate = RATES[(RATES.indexOf(narrRate) + 1) % RATES.length] || 1.05;
+    localStorage.setItem("cw.rate", String(narrRate));
+    setVoiceBtn();
+    if (narrBusy) {           // restart the current sentence at the new speed
+      const rest = narrQ.slice();
+      narrStop();
+      narrOn = true;
+      narrEnqueue(rest);
+    }
+  };
+  setVoiceBtn();
+
   async function ask(text, cont) {
     if (busy) return;
     const q = (text || "").trim();
@@ -2411,6 +2623,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
     pfLabel = null; pfReady = false;
 
     retireContinues();
+    narrStop();
     const t = tab(active);
     const sent = refs.slice();
     let context = "";
@@ -2454,6 +2667,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
     updateJump();
 
     let acc = "", autoIdx = -1, nextPrefetch = null;
+    const narr = { raw: "", el: out, sent: 0 };
 
     try {
       const res = await fetch("/api/ask", {
@@ -2478,12 +2692,13 @@ textarea:focus { outline: none; border-color: var(--accent); }
             const tm = TITLE_RE.exec(acc);
             if (tm) setCellTitle(msg, (tm[1] || "").trim());
             renderReply(out, acc);
+            narrFeed(narr, acc, out, false);
             const ds = allDirectives(acc);
-            if (follow && ds.length - 1 > autoIdx) {
+            if (follow && !narrOn && ds.length - 1 > autoIdx) {
               autoIdx = ds.length - 1;
               openFile(ds[autoIdx].path, ds[autoIdx].spec);
             }
-            markActiveChip(out, autoIdx);
+            if (!narrOn) markActiveChip(out, autoIdx);
           } else if (ev.k === "tool") {
             const a = document.createElement("div");
             a.className = "act"; a.textContent = ev.v;
@@ -2513,12 +2728,17 @@ textarea:focus { outline: none; border-color: var(--accent); }
           addContinue(msg, label);
           nextPrefetch = label;
         }
+        msg.dataset.raw = acc;
+        addReplay(acts, msg, out);
+        narrFeed(narr, acc, out, true);
         const ds = allDirectives(acc);
-        if (ds.length && autoIdx < 0) {
-          autoIdx = 0;
-          openFile(ds[0].path, ds[0].spec);
+        if (!narrOn) {
+          if (ds.length && autoIdx < 0) {
+            autoIdx = 0;
+            openFile(ds[0].path, ds[0].spec);
+          }
+          markActiveChip(out, autoIdx);
         }
-        markActiveChip(out, autoIdx);
       }
     } catch (err) {
       const e = document.createElement("div");
@@ -2568,6 +2788,8 @@ textarea:focus { outline: none; border-color: var(--accent); }
   $("filter").addEventListener("input", renderTree);
   document.addEventListener("keydown", (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === "p") { e.preventDefault(); $("filter").focus(); $("filter").select(); }
+    // Escape shuts the voice up without turning narration off for the next step.
+    if (e.key === "Escape" && narrBusy) { e.preventDefault(); narrStop(); }
   });
 
   // ---------------- sashes ----------------
