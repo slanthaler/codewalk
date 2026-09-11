@@ -1172,6 +1172,9 @@ body {
 }
 .iconbtn:hover:not(:disabled) { color: var(--fg-dim); background: var(--bg-hover); }
 .iconbtn:disabled { opacity: 0.4; cursor: default; }
+.rateWrap { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--fg-faint); }
+.rateWrap input { width: 74px; accent-color: var(--hl-rail); cursor: pointer; }
+.rateWrap #rateVal { font-family: var(--mono); min-width: 34px; text-align: right; }
 
 /* explorer */
 #filter {
@@ -1395,7 +1398,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
   <div class="sash" id="sash2" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize chat"></div>
 
   <section class="pane" id="chat">
-    <div class="paneHead"><span>Walkthrough</span><span class="spacer"></span><button class="iconbtn" id="voice" title="Read the walkthrough aloud and move the editor in time with the voice">Voice: off</button><button class="iconbtn" id="rate" title="Speaking speed" hidden>1.05×</button><button class="iconbtn" id="follow" title="Let Claude move the editor as it explains">Follow: on</button><button class="iconbtn" id="clearHl" disabled>Clear highlight</button><button class="iconbtn" id="cellPrev" title="Previous step (Alt+Up)" disabled>&#8593;</button><button class="iconbtn" id="cellNext" title="Next step (Alt+Down)" disabled>&#8595;</button></div>
+    <div class="paneHead"><span>Walkthrough</span><span class="spacer"></span><button class="iconbtn" id="voice" title="Read the walkthrough aloud and move the editor in time with the voice">Voice: off</button><span class="rateWrap" id="rateWrap" hidden title="Speaking speed — drag, or Alt+, / Alt+. "><input type="range" id="rate" min="0.6" max="2.2" step="0.05" value="1.05" aria-label="Speaking speed"><span id="rateVal">1.05×</span></span><button class="iconbtn" id="follow" title="Let Claude move the editor as it explains">Follow: on</button><button class="iconbtn" id="clearHl" disabled>Clear highlight</button><button class="iconbtn" id="cellPrev" title="Previous step (Alt+Up)" disabled>&#8593;</button><button class="iconbtn" id="cellNext" title="Next step (Alt+Down)" disabled>&#8595;</button></div>
     <div id="logwrap">
       <button id="jumpDown" hidden title="Jump to the latest step">&#8595; latest</button>
       <div id="log"><div id="tailpad"></div></div>
@@ -2415,6 +2418,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
   let narrQ = [];          // queued {say, fire, idx, scope}
   let narrBusy = false;
   let narrToken = 0;       // bumped on every stop; stale callbacks check it
+  let narrCurrent = null;  // the chunk in the speaker's mouth, so a rate change can repeat it
 
   // Chrome stops speaking after ~15s of one utterance unless it is nudged.
   if (synth) setInterval(() => {
@@ -2438,6 +2442,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
     narrToken++;
     narrQ = [];
     narrBusy = false;
+    narrCurrent = null;
     if (synth) synth.cancel();
   }
 
@@ -2453,6 +2458,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
     if (it.fire) it.fire();
     if (!it.say) { narrPump(); return; }
     const tok = narrToken;
+    narrCurrent = it;
     const u = new SpeechSynthesisUtterance(it.say);
     if (narrVoice) { u.voice = narrVoice; u.lang = narrVoice.lang; }
     u.rate = narrRate;
@@ -2460,6 +2466,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
     const next = () => {
       if (tok !== narrToken) return;     // a stop happened while we were talking
       narrBusy = false;
+      narrCurrent = null;
       narrPump();
     };
     u.onend = next;
@@ -2584,12 +2591,13 @@ textarea:focus { outline: none; border-color: var(--accent); }
     narrEnqueue(narrChunks(raw, state));
   }
 
-  const voiceBtn = $("voice"), rateBtn = $("rate");
+  const voiceBtn = $("voice"), rateEl = $("rate"), rateWrap = $("rateWrap");
   function setVoiceBtn() {
     voiceBtn.textContent = "Voice: " + (narrOn ? "on" : "off");
     voiceBtn.style.color = narrOn ? "var(--hl-rail)" : "";
-    rateBtn.hidden = !narrOn;
-    rateBtn.textContent = narrRate.toFixed(2).replace(/0$/, "") + "×";
+    rateWrap.hidden = !narrOn;
+    rateEl.value = String(narrRate);
+    $("rateVal").textContent = narrRate.toFixed(2).replace(/0$/, "") + "\u00d7";
   }
   if (!synth) voiceBtn.hidden = true;
   voiceBtn.onclick = () => {
@@ -2598,18 +2606,34 @@ textarea:focus { outline: none; border-color: var(--accent); }
     if (!narrOn) narrStop();
     setVoiceBtn();
   };
-  const RATES = [0.9, 1.05, 1.2, 1.4, 1.6];
-  rateBtn.onclick = () => {
-    narrRate = RATES[(RATES.indexOf(narrRate) + 1) % RATES.length] || 1.05;
+  // The rate is a live regulator: a speaking utterance cannot be re-rated in place,
+  // so the current sentence is re-spoken at the new speed and the queue rides along.
+  // While the slider is being dragged, only the readout moves — restarting the voice
+  // on every pixel would stutter.
+  let rateTimer = null;
+  function setRate(v, immediate) {
+    narrRate = Math.min(2.2, Math.max(0.6, Math.round(v * 20) / 20));
     localStorage.setItem("cw.rate", String(narrRate));
     setVoiceBtn();
-    if (narrBusy) {           // restart the current sentence at the new speed
+    clearTimeout(rateTimer);
+    const apply = () => {
+      if (!narrBusy) return;
       const rest = narrQ.slice();
+      const cur = narrCurrent;
       narrStop();
       narrOn = true;
+      if (cur) rest.unshift({ say: cur.say, fire: null });   // repeat it, do not re-open
       narrEnqueue(rest);
-    }
-  };
+    };
+    rateTimer = setTimeout(apply, immediate ? 0 : 260);
+  }
+  rateEl.oninput = () => setRate(Number(rateEl.value), false);
+  rateEl.onchange = () => setRate(Number(rateEl.value), true);
+  document.addEventListener("keydown", (e) => {
+    if (!e.altKey || e.ctrlKey || e.metaKey) return;
+    if (e.key === ",") { e.preventDefault(); setRate(narrRate - 0.1, true); }
+    if (e.key === ".") { e.preventDefault(); setRate(narrRate + 0.1, true); }
+  });
   setVoiceBtn();
 
   async function ask(text, cont) {
