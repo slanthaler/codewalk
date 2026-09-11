@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-codewalk — a local three-pane codebase walkthrough: tree | file | chat.
+codewalk — a local three-pane workspace for talking about code: tree | file | chat.
 
     python codewalk.py [ROOT] [--port 8765] [--model opus] [--no-open]
 
@@ -404,8 +404,8 @@ def css_class(ttype) -> str:
 # ----------------------------------------------------------------------------------
 
 RULES = """\
-You are the guide inside codewalk: a local three-pane dashboard the reader is looking at RIGHT \
-NOW, walking them through the codebase rooted at {root}.
+You are Claude, working with someone on the codebase rooted at {root}. You are inside codewalk: a \
+local three-pane dashboard they are looking at RIGHT NOW.
 
     left     the file tree
     center   the file you last opened, scrolled to the lines you last highlighted
@@ -424,12 +424,17 @@ of their view while the rest fills in underneath. They start reading the moment 
 land, so those words must carry the point: no preamble, no restating the question, no throat \
 clearing. They can also jump back through earlier cells by title, which is what the titles are for.
 
-Whatever they ask — a direct question, a design discussion, a review of something they are \
-about to build — your first move is to put the relevant code in front of them. Find it, open it at \
-the exact lines with [[open:...]], and say briefly what it does and why it matters. A question like \
-"which transformer architecture is this" is answered by opening the class and the two lines that \
-give it away, not by describing them from memory. Showing beats telling every time, and a short \
-answer anchored on real lines is worth more than a long one that is not.
+Answer what they actually asked. This is an ordinary working conversation about code — a \
+question, a debugging session, a design argument, a review, a change they want made — and the \
+pane is what makes it better than a terminal, not a format you have to fill. Do not turn a \
+question into a tour. Do not offer a tour, a plan of what you will cover, or a numbered syllabus \
+unless they ask to be walked through something; if they do ask, directive 3 is how you pace it.
+
+What the dashboard does change is that showing beats telling. Whatever they ask, put the relevant \
+code in front of them: find it, open it at the exact lines with [[open:...]], and say what matters \
+about it. "Which transformer architecture is this" is answered by opening the class and the two \
+lines that give it away, not by describing them from memory. A short answer anchored on real lines \
+is worth more than a long one that is not.
 
 This holds when the code does not exist yet. If you are thinking through a new implementation with \
 them, keep opening the code it would touch, sit next to, or replace — a design conversation \
@@ -464,14 +469,18 @@ two blocks. Seeing the exact lines that would go and the exact lines that would 
 makes the discussion precise, and Apply stays theirs to ignore.
 
 
-3. To pace a walkthrough, end a step with
+3. When you have more to say than belongs in one reply, end with
 
 [[continue: what comes next]]
 
-which the dashboard turns into a Continue button. Use it whenever you have more to say than fits in
-one bite. A step is ONE idea: at most two short paragraphs and one to three [[open:...]] directives,
-then stop and let them press it. Never deliver a whole tour in a single message — a reader cannot
-follow at the speed you write. If there is nothing more to say, leave it out.
+which the dashboard turns into a Continue button. This is for genuinely serial material — a \
+walkthrough they asked for, a long investigation, a chain of related changes. Then a step is ONE \
+idea: at most two short paragraphs and one to three [[open:...]] directives, and you stop and let \
+them press it, because a reader cannot follow at the speed you write.
+
+Most replies are not that. A question that has an answer gets the answer and no Continue button; \
+leaving it out is the normal case, and inventing a next step to have something to offer is worse \
+than stopping.
 
 The dashboard may run the next step BEFORE the reader has pressed anything, so that Continue feels \
 instant. A step therefore has to stand on its own: never open by referring to what they just \
@@ -483,7 +492,7 @@ opened yourself.
 [[title: three to six words]]
 
 on its own first line, naming what that reply is about. It is stripped from the prose and used as \
-the heading on that cell, so the reader can scan back through the walkthrough and find it again. \
+the heading on that cell, so they can scan back through the conversation and find it again. \
 Name the specific subject, not the genre: "RevIN running statistics" or "why the mask is \
 concatenated", never "Explanation" or "Next step". Do not repeat the title in the body text.
 
@@ -1585,9 +1594,6 @@ select.iconbtn { padding: 2px 4px; text-transform: none; letter-spacing: 0; }
 #addSel:hover { background: var(--btn-hover); }
 #addSel kbd { font-family: var(--mono); font-size: 10px; opacity: 0.7; margin-left: 5px; }
 #ctx button { font: inherit; background: none; border: 0; color: var(--fg-faint); cursor: pointer; text-decoration: underline; padding: 0; }
-.starters { display: flex; flex-wrap: wrap; gap: 5px; }
-.starters button { font: inherit; font-size: 11.5px; background: #2d2d2d; color: var(--fg-faint); border: 1px solid var(--border); border-radius: 2px; padding: 3px 8px; cursor: pointer; }
-.starters button:hover { color: var(--fg-dim); background: var(--bg-hover); }
 .row { display: flex; gap: 8px; align-items: flex-end; }
 textarea { flex: 1; resize: none; font-family: var(--ui); font-size: 13px; color: var(--fg-dim); background: var(--bg-input); border: 1px solid var(--border); border-radius: 2px; padding: 7px 9px; min-height: 32px; max-height: 160px; line-height: 1.5; }
 textarea:focus { outline: none; border-color: var(--accent); }
@@ -1642,7 +1648,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
   <div class="sash" id="sash2" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize chat"></div>
 
   <section class="pane" id="chat">
-    <div class="paneHead"><span>Walkthrough</span><span class="spacer"></span><select class="iconbtn" id="model" title="Which model answers. Takes effect on the next question; the conversation so far is kept."></select><button class="iconbtn" id="voice" title="Read the walkthrough aloud and move the editor in time with the voice">Voice: off</button><span class="rateWrap" id="rateWrap" hidden title="Speaking speed — drag, or Alt+, / Alt+. "><input type="range" id="rate" min="0.5" max="2" step="0.25" value="1" aria-label="Speaking speed"><span id="rateVal">1×</span></span><button class="iconbtn" id="follow" title="Let Claude move the editor as it explains">Follow: on</button><button class="iconbtn" id="clearHl" disabled>Clear highlight</button><button class="iconbtn" id="cellPrev" title="Previous step (Alt+Up)" disabled>&#8593;</button><button class="iconbtn" id="cellNext" title="Next step (Alt+Down)" disabled>&#8595;</button></div>
+    <div class="paneHead"><span class="spacer"></span><select class="iconbtn" id="model" title="Which model answers. Takes effect on the next question; the conversation so far is kept."></select><button class="iconbtn" id="voice" title="Read the answers aloud and move the editor in time with the voice">Voice: off</button><span class="rateWrap" id="rateWrap" hidden title="Speaking speed — drag, or Alt+, / Alt+. "><input type="range" id="rate" min="0.5" max="2" step="0.25" value="1" aria-label="Speaking speed"><span id="rateVal">1×</span></span><button class="iconbtn" id="follow" title="Let Claude move the editor as it explains">Follow: on</button><button class="iconbtn" id="clearHl" disabled>Clear highlight</button><button class="iconbtn" id="cellPrev" title="Previous step (Alt+Up)" disabled>&#8593;</button><button class="iconbtn" id="cellNext" title="Next step (Alt+Down)" disabled>&#8595;</button></div>
     <div id="logwrap">
       <button id="jumpDown" hidden title="Jump to the latest step">&#8595; latest</button>
       <div id="log"><div id="tailpad"></div></div>
@@ -1650,7 +1656,6 @@ textarea:focus { outline: none; border-color: var(--accent); }
     <div id="composer">
       <div id="ctx" hidden></div>
       <div class="refbar" id="refs" hidden></div>
-      <div class="starters" id="starters"></div>
       <div class="row">
         <textarea id="box" rows="1" placeholder="Ask about this codebase…" aria-label="Message"></textarea>
         <button class="btn" id="send">Send</button>
@@ -1772,7 +1777,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
 
   // ---------------- navigation history ----------------
   // Every place the editor is sent — a tree click, a tab, one of Claude's chips — is an
-  // entry here, so the arrows replay a walkthrough the way browser history replays a session.
+  // entry here, so the arrows replay the visit the way browser history replays a session.
   let hist = [], hIdx = -1, navLock = false;
   const HIST_MAX = 200;
 
@@ -3328,19 +3333,6 @@ textarea:focus { outline: none; border-color: var(--accent); }
     }
   }
 
-  const STARTERS = [
-    "Give me the tour: what is in this project and how does it fit together?",
-    "Where does execution start?",
-    "What are the least obvious design choices here?",
-    "Where is this most likely to break?",
-  ];
-  for (const s of STARTERS) {
-    const b = document.createElement("button");
-    b.textContent = s;
-    b.onclick = () => ask(s);
-    $("starters").appendChild(b);
-  }
-
   sendEl.onclick = () => { const v = boxEl.value; boxEl.value = ""; boxEl.style.height = "auto"; ask(v); };
   boxEl.addEventListener("keydown", (e) => {
     if (e.key !== "Enter" || e.shiftKey) return;
@@ -3461,7 +3453,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
       (d.context
         ? "<p>Picking up from our terminal session \u2014 I already have the context of what we built here.</p>"
         : "<p>Ask me anything about <code>" + d.name + "</code>. I will read whatever files I need and " +
-          "open them in the center pane, highlighting the lines as I explain them.</p>") +
+          "open them in the center pane, on the lines I am talking about.</p>") +
       "<p class='notice'>Click a chip in my answer to jump there. Drag the line-number gutter or select code and press Ctrl-L to attach it to a question. Ctrl-P filters the tree.</p>";
     if (d.first_question) ask(d.first_question);
   });
@@ -3473,7 +3465,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Local three-pane codebase walkthrough.")
+    ap = argparse.ArgumentParser(description="Local three-pane workspace for talking about code.")
     ap.add_argument("root", nargs="?", default=".", help="project root (default: .)")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--model", default="opus", help="alias passed to `claude --model`")
@@ -3507,7 +3499,7 @@ def main():
     ap.add_argument("--brief-file", default=None, metavar="PATH",
                     help="a file of instructions for the dashboard session (added to --brief)")
     ap.add_argument("--start", default="", metavar="QUESTION",
-                    help="ask this the moment the page opens, so the walkthrough begins by itself")
+                    help="ask this the moment the page opens, so the conversation starts by itself")
     ap.add_argument("--sync-file", default=None, metavar="PATH",
                     help="show Sync buttons that publish the conversation to PATH, for a terminal "
                          "session to pick up. Works with or without --handoff.")
