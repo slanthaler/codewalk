@@ -2673,6 +2673,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
           }
           if (++ttsFails >= TTS_GIVE_UP) {
             ttsOK = false;
+            setVoiceBtn();
             flash("voice: the server stopped answering");
           }
           next();
@@ -2993,7 +2994,12 @@ textarea:focus { outline: none; border-color: var(--accent); }
   const voiceBtn = $("voice"), rateEl = $("rate"), rateWrap = $("rateWrap");
   function setVoiceBtn() {
     voiceBtn.textContent = narrBlocked ? "Voice: click to start"
-                                       : "Voice: " + (narrOn ? "on" : "off");
+                         : !narrOn ? "Voice: off"
+                         : ttsOK ? "Voice: on"
+                         : "Voice: browser";      // Piper gave up; this is the other engine
+    voiceBtn.title = narrOn && !ttsOK
+      ? "The Piper server stopped answering, so this is the browser's own speech engine"
+      : "Read the answers aloud and move the editor in time with the voice";
     voiceBtn.style.color = narrOn ? "var(--hl-rail)" : "";
     rateWrap.hidden = !narrOn;
     rateEl.value = String(narrRate);
