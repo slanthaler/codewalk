@@ -2533,11 +2533,6 @@ textarea:focus { outline: none; border-color: var(--accent); }
   let narrToken = 0;       // bumped on every stop; stale callbacks check it
   let narrCurrent = null;  // the chunk in the speaker's mouth, so a rate change can repeat it
 
-  // Chrome stops speaking after ~15s of one utterance unless it is nudged.
-  if (synth) setInterval(() => {
-    if (narrBusy && synth.speaking && !synth.paused) { synth.pause(); synth.resume(); }
-  }, 8000);
-
   const VOICE_RANK = ["ryan", "lessac", "piper", "google us english", "microsoft aria", "samantha",
                       "english (america)", "en-us", "english"];
   function pickVoice() {
@@ -2558,6 +2553,13 @@ textarea:focus { outline: none; border-color: var(--accent); }
   let ttsOK = false;
   const audioEl = new Audio();
   const AHEAD = 3;
+  // A failed synthesis used to set ttsOK = false for good, so one hiccup -- a server
+  // restarted under an open tab, say -- silently moved the rest of the answer onto the
+  // browser's own speech engine, mid-paragraph, at a different speed and in a different
+  // voice. Now a failure costs that one sentence its retry, and the server is tried
+  // again for the next; only a run of them gives up, and then it says so.
+  let ttsFails = 0;
+  const TTS_GIVE_UP = 3;
 
   // Chrome refuses audio.play() until the page has been clicked, and a reload with
   // Voice already on has no click yet. The old speechSynthesis path was never gated
@@ -2659,7 +2661,24 @@ textarea:focus { outline: none; border-color: var(--accent); }
       narrSynth(it);
       it.wav.then((blob) => {
         if (tok !== narrToken) return;
-        if (!blob) { ttsOK = false; next(); return; }   // Piper died; fall back next time
+        if (!blob) {
+          if (!it.retried) {                 // one hiccup: ask again for this sentence
+            it.retried = true;
+            it.wav = null;
+            narrQ.unshift(it);
+            narrBusy = false;
+            narrCurrent = null;
+            narrPump();
+            return;
+          }
+          if (++ttsFails >= TTS_GIVE_UP) {
+            ttsOK = false;
+            flash("voice: the server stopped answering");
+          }
+          next();
+          return;
+        }
+        ttsFails = 0;
         it.url = URL.createObjectURL(blob);
         audioEl.src = it.url;
         audioEl.playbackRate = 1;
