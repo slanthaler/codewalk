@@ -2560,6 +2560,13 @@ textarea:focus { outline: none; border-color: var(--accent); }
   // again for the next; only a run of them gives up, and then it says so.
   let ttsFails = 0;
   const TTS_GIVE_UP = 3;
+  // Whether this server HAS Piper, as opposed to whether it is answering right now.
+  // If it has it, a failure is transient and the answer is to wait, not to switch
+  // engines mid-paragraph: on this machine the browser's own speech also routes to
+  // Piper through speech-dispatcher, so the fallback sounds like the same voice
+  // coming apart rather than like a different one. The queue is held instead.
+  let ttsServer = false;
+  let narrHeld = false;
 
   // Chrome refuses audio.play() until the page has been clicked, and a reload with
   // Voice already on has no click yet. The old speechSynthesis path was never gated
@@ -2603,6 +2610,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
     narrQ = [];
     narrBusy = false;
     narrCurrent = null;
+    narrHeld = false;
     audioEl.pause();
     audioEl.removeAttribute("src");
     if (synth) synth.cancel();
@@ -2638,7 +2646,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
   }
 
   function narrPump() {
-    if (narrBusy || narrBlocked || !narrQ.length) return;
+    if (narrBusy || narrBlocked || narrHeld || !narrQ.length) return;
     const it = narrQ.shift();
     if (!it.say) {                       // a directive with nothing to say around it
       narrMarks(it, 0);
@@ -2672,7 +2680,18 @@ textarea:focus { outline: none; border-color: var(--accent); }
             return;
           }
           if (++ttsFails >= TTS_GIVE_UP) {
-            ttsOK = false;
+            if (ttsServer) {          // it has Piper; hold the queue until it answers
+              narrQ.unshift(it);
+              it.wav = null;
+              it.retried = false;
+              narrBusy = false;
+              narrCurrent = null;
+              narrHeld = true;
+              setVoiceBtn();
+              flash("voice: the server stopped answering — click Voice to retry");
+              return;
+            }
+            ttsOK = false;            // no Piper here at all: the browser is all there is
             setVoiceBtn();
             flash("voice: the server stopped answering");
           }
@@ -2808,6 +2827,27 @@ textarea:focus { outline: none; border-color: var(--accent); }
   const SHAPE = /\(([^()\n]{1,60})\)/g;          // a parenthesised tuple, maybe a shape
   const SHAPEY = /^[\w\s,+*/\-]+$/;               // ...only if it is all symbols and names
 
+  // A character espeak-ng has no name for is read as its CODEPOINT: the transpose
+  // mark in QK\u1d40 comes out as "letter one D four zero", and a sentence with a few of
+  // those turns into a fast stream of letters and digits -- which is what "the voice
+  // suddenly sped up and became babble" actually was. Nothing gets past this: the
+  // compatibility forms are normalized to their plain letters, the symbols worth saying
+  // are said, and anything left that is not plainly sayable is dropped.
+  const SYMBOLS = [
+    [/[\u2018\u2019]/g, "'"], [/[\u201c\u201d]/g, '"'],
+    [/[\u2014\u2013\u2012]/g, ", "], [/\u00b7/g, " "], [/\u2026/g, "..."],
+    [/\u2207/g, " grad "], [/\u2202/g, " partial "], [/\u222b/g, " integral "],
+    [/\u2211/g, " sum "], [/\u220f/g, " product "], [/\u221e/g, " infinity "],
+    [/\u2208/g, " in "], [/\u2209/g, " not in "], [/\u2200/g, " for all "],
+    [/\u2203/g, " there exists "], [/[\u2225\u2016]/g, " norm "], [/\u2299/g, " elementwise times "],
+    [/\u2297/g, " tensor product "], [/\u21d2/g, " implies "], [/\u2261/g, " identical to "],
+    [/\u2192/g, " to "], [/\u2190/g, " from "], [/\u2194/g, " to and from "],
+    [/\u221d/g, " proportional to "], [/\u226a/g, " much less than "],
+    [/\u226b/g, " much greater than "], [/[\u27e8\u27e9]/g, " "],
+  ];
+  // Latin, Greek and the punctuation espeak can actually pronounce. Everything else goes.
+  const UNSAYABLE = /[^\u0000-\u024f\u0370-\u03ff\u1e00-\u1eff\u221a\u2248\u2260\u2264\u2265\u00d7\u00f7\u00b1]/g;
+
   const SAY = [
     [/\s*(?:->|→|=>)\s*/g, " to "],
     [/\s*==\s*/g, " equals "],
@@ -2822,6 +2862,9 @@ textarea:focus { outline: none; border-color: var(--accent); }
   ];
 
   function speechify(s) {
+    s = s.normalize("NFKC");                  // superscripts and the like become letters
+    for (const [re, to] of SYMBOLS) s = s.replace(re, to);
+    s = s.replace(UNSAYABLE, " ");
     s = s.replace(SHAPE, (m, inner) => {
       if (!inner.includes(",") || !SHAPEY.test(inner)) return m;
       // A shape is read the way it is said out loud: b by n by d, not b comma n comma d.
@@ -2995,10 +3038,13 @@ textarea:focus { outline: none; border-color: var(--accent); }
   function setVoiceBtn() {
     voiceBtn.textContent = narrBlocked ? "Voice: click to start"
                          : !narrOn ? "Voice: off"
+                         : narrHeld ? "Voice: retry"
                          : ttsOK ? "Voice: on"
-                         : "Voice: browser";      // Piper gave up; this is the other engine
-    voiceBtn.title = narrOn && !ttsOK
-      ? "The Piper server stopped answering, so this is the browser's own speech engine"
+                         : "Voice: browser";      // no Piper here; the browser is speaking
+    voiceBtn.title = narrHeld
+      ? "The voice server stopped answering. Click to pick up where it stopped."
+      : narrOn && !ttsOK
+      ? "This server has no Piper, so this is the browser's own speech engine"
       : "Read the answers aloud and move the editor in time with the voice";
     voiceBtn.style.color = narrOn ? "var(--hl-rail)" : "";
     rateWrap.hidden = !narrOn;
@@ -3009,6 +3055,13 @@ textarea:focus { outline: none; border-color: var(--accent); }
 
   voiceBtn.onclick = () => {
     narrUnblock();
+    if (narrHeld) {                   // a held queue: the click is "try again", not "off"
+      narrHeld = false;
+      ttsFails = 0;
+      setVoiceBtn();
+      narrPump();
+      return;
+    }
     narrOn = !narrOn;
     localStorage.setItem("cw.voice", narrOn ? "1" : "0");
     if (!narrOn) narrStop();
@@ -3309,6 +3362,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
     if (d.handoff) setInterval(() => { fetch("/api/ping").catch(() => {}); }, 3000);
     setupCells();
     ttsOK = !!d.tts;
+    ttsServer = !!d.tts;
     if (!ttsOK && !synth) { narrOn = false; voiceBtn.hidden = true; }
     setVoiceBtn();
     setupModel(d.model, d.models);

@@ -50,8 +50,26 @@ const SPEECH_CASES = [
   ["maps x -> y in a 3 x 4 grid", "maps x to y in a 3 by 4 grid"],
   ["the (only) caveat", "the (only) caveat"],                  // prose parens are left alone
   ["call predict_batch(x, horizon=64)", "call predict_batch(x, horizon equals 64)"],
+  // espeak-ng reads a character it has no name for as its codepoint -- the transpose
+  // mark alone becomes "letter one D four zero" -- so nothing exotic may survive.
+  ["score = QK\u1d40/\u221ahead_dim", "score equals QKT/\u221ahead_dim"],
+  ["x\u1d62 and h\u1d57 in \u211d", "xi and ht in R"],
+  ["a \u2299 b, c \u2297 d, \u2207f \u2208 S", "a elementwise times b, c tensor product d, grad f in S"],
+  ["(B, T, d) \u2192 (B, h, T, k)", "B by T by d to B by h by T by k"],
 ];
+
+// Whatever comes out must be sayable: Latin, Greek, and the handful of symbols espeak
+// pronounces. Anything else and the voice starts spelling codepoints out loud.
+const SAYABLE = /^[\u0000-\u024f\u0370-\u03ff\u1e00-\u1eff\u221a\u2248\u2260\u2264\u2265\u00d7\u00f7\u00b1]*$/;
+const EXOTIC = "The loss is \u2211\u1d62 x\u1d62\u1d40 W x\u1d62 \u2264 \u221e over \ud835\udd3c[\u211d\u207f], with \u2225x\u2225 \u2192 0 \u21d2 done.";
 let speechBad = 0;
+{
+  const got = F.narrClean(EXOTIC);
+  if (!SAYABLE.test(got)) {
+    speechBad++;
+    console.log("speech: unsayable characters survive: " + JSON.stringify(got));
+  }
+}
 for (const [from, want] of SPEECH_CASES) {
   const got = F.narrClean(from);
   if (got !== want) {
