@@ -3,18 +3,20 @@
 codewalk — a local three-pane workspace for talking about code: tree | file | chat.
 
     python codewalk.py [ROOT] [--port 8765] [--model opus] [--no-open]
+    python codewalk.py [ROOT] --worktree <topic>      # work on a scratch branch instead
 
-Left:   the repo file tree (from `git ls-files` when ROOT is a git repo), with a filter box.
+Left:   the repo file tree (from `git ls-files` when ROOT is a git repo), with a filter box,
+        and below it the Changes list — every file that differs from the base commit.
 Center: the open file, syntax-highlighted (Pygments, server-side), with line numbers and tabs.
 Right:  a chat that shells out to the `claude` CLI, streaming the answer back.
 
-Claude gets read-only tools (Read, Grep, Glob) confined to ROOT, so it pulls files up itself,
-and steers the center pane with two directives:
+Claude reads and edits inside ROOT, and steers the center pane with
 
     [[open:path/to/file.py:120-140|label]]     open that file, highlight and scroll to the range
-    [[edit:path/to/file.py:120-140]]           propose a replacement, shown as a diff with Apply
-    ...replacement lines...
-    [[/edit]]
+
+Under --worktree, ROOT is a scratch checkout on its own branch: Claude changes files there,
+the user reviews the diff hunk by hunk, and All Good writes the result into their real repo
+as uncommitted changes.
 
 Standard library only, plus Pygments for highlighting (optional — falls back to plain text).
 """
@@ -74,7 +76,7 @@ class Repo:
         self._files: list[str] | None = None
         self._files_at = 0.0
         self._lock = threading.Lock()
-        self.is_git = os.path.isdir(os.path.join(self.root, ".git"))
+        self.is_git = os.path.exists(os.path.join(self.root, ".git"))
 
     # -- path safety -----------------------------------------------------------
     def resolve(self, rel: str) -> str | None:
@@ -180,7 +182,10 @@ class Repo:
             return {"ok": False, "error": f"Lines {start}-{end} are outside this {shown}-line file."}
         body = "\n".join(old[: start - 1] + replacement.split("\n") + old[end:])
         try:
-            shutil.copyfile(full, full + ".codewalk.bak")
+            # No .bak copy. The previous content is in the branch this worktree is on, which
+            # is the whole reason for working on a branch — and a stray backup file would
+            # show up in the Changes list as new work and get carried into the user's repo
+            # on Accept, which is exactly the pollution this design exists to prevent.
             with open(full, "w", encoding="utf-8") as fh:
                 fh.write(body)
         except OSError as e:
@@ -197,119 +202,475 @@ def cache_root() -> str:
     return os.path.join(base, "codewalk")
 
 
-def default_shadow(root: str) -> str:
-    """Outside the repo on purpose: the file tree comes from `git ls-files`, so a shadow
-    inside the root would either pollute the tree or be invisible to it."""
+def default_trees(root: str) -> str:
+    """Outside the repo on purpose: a worktree nested inside its own source is a mess git
+    tolerates and no tool expects."""
     tag = hashlib.sha256(os.path.abspath(root).encode("utf-8")).hexdigest()[:8]
-    return os.path.join(cache_root(), "shadow", f"{os.path.basename(root.rstrip(os.sep))}-{tag}")
+    return os.path.join(cache_root(), "trees", f"{os.path.basename(root.rstrip(os.sep))}-{tag}")
 
 
-class Shadow:
-    """A sparse mirror of the repo holding proposals the user has not agreed to yet.
+class Worktree:
+    """A scratch checkout of the repo, on its own branch, where the agent does its work.
 
-    Sparse is the point: a file exists here only because there is a pending proposal for it,
-    so presence *is* the signal and no read ever has to ask which tree is authoritative.
+    This is the whole safety model, and it is git's, not ours: the agent writes real files
+    into a real tree that tests can run against, and none of it is in the checkout the user
+    is editing. Nothing has to arbitrate which copy is authoritative — the branch is.
     """
 
-    def __init__(self, root: str, repo: "Repo"):
-        self.root = os.path.abspath(root)
-        self.repo = repo
-        os.makedirs(self.root, exist_ok=True)
+    def __init__(self, source: str, branch: str, path: str | None):
+        self.source = os.path.abspath(source)
+        self.branch = branch
+        self.path = os.path.abspath(path) if path else os.path.join(
+            default_trees(self.source), branch.replace("/", "-"))
+        self.source_ref = ""   # what it grew out of; the base every diff is taken against
+        self.attached = False  # it already existed and we joined it
+        self.dirty = 0         # uncommitted paths in the SOURCE, before anything is carried
+        self.carried = ""      # commit holding that work, once it is in this tree
 
-    def resolve(self, rel: str) -> str | None:
-        rel = rel.lstrip("/")
-        if not rel:
+    def _git(self, *args: str, cwd: str | None = None) -> tuple[int, str, str]:
+        try:
+            out = subprocess.run(
+                ["git", *args], cwd=cwd or self.source,
+                capture_output=True, text=True, errors="replace", timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            return 1, "", str(e)
+        return out.returncode, out.stdout.strip(), out.stderr.strip()
+
+    def _existing(self) -> str | None:
+        """The path of a worktree already checked out on this branch, if there is one."""
+        code, out, _ = self._git("worktree", "list", "--porcelain")
+        if code != 0:
             return None
-        candidate = os.path.realpath(os.path.join(self.root, rel))
-        root = os.path.realpath(self.root)
-        if candidate != root and not candidate.startswith(root + os.sep):
+        path = None
+        for line in out.split("\n"):
+            if line.startswith("worktree "):
+                path = line[9:]
+            elif line == "branch refs/heads/" + self.branch and path:
+                return path
+        return None
+
+    def open(self) -> None:
+        """Create the worktree, or attach to the one that is already on this branch."""
+        if not os.path.exists(os.path.join(self.source, ".git")):
+            sys.exit(f"codewalk: --worktree needs a git repository; {self.source} is not one")
+        code, head, _ = self._git("rev-parse", "HEAD")
+        if code != 0:
+            sys.exit(f"codewalk: --worktree needs a repository with at least one commit")
+
+        # Captured before anything moves. merge-base against this name is the fork point
+        # for the whole life of the branch, however far the source advances afterwards.
+        code, name, _ = self._git("symbolic-ref", "--quiet", "--short", "HEAD")
+        self.source_ref = name if code == 0 and name else head
+
+        code, out, _ = self._git("status", "--porcelain")
+        self.dirty = len([l for l in out.split("\n") if l.strip()]) if code == 0 else 0
+
+        here = self._existing()
+        # git itself would refuse to add a second worktree for a branch that is already
+        # checked out — but if it is checked out HERE, "reuse it" would mean handing the
+        # agent the user's own working tree while telling them it was isolated.
+        if here and os.path.realpath(here) == os.path.realpath(self.source):
+            sys.exit(f"codewalk: {self.branch} is the branch checked out in {self.source} "
+                     f"itself, so its worktree is that same tree — nothing would be isolated. "
+                     f"Switch that checkout to another branch, or pick another --worktree topic.")
+        if here:
+            self.path, self.attached = here, True
+            # Re-joining a branch that already has history: measure from the last thing
+            # codewalk itself pinned there — the carry at its creation, or the most recent
+            # Accept. Falling back to the fork point would show every previously carried or
+            # accepted file as fresh work of the agent's, which is the one thing the list
+            # must not do.
+            code, sha, _ = self._git("log", "-1", "--format=%H", "--grep", "^codewalk:",
+                                     self.branch)
+            if code == 0 and sha:
+                self.carried = sha
+            return
+
+        if os.path.exists(self.path) and os.listdir(self.path):
+            sys.exit(f"codewalk: {self.path} already exists and is not a worktree for "
+                     f"{self.branch}. Pass --worktree-dir, or remove it.")
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+
+        code, _, _ = self._git("rev-parse", "--verify", "--quiet", "refs/heads/" + self.branch)
+        if code == 0:      # the branch is there, just not checked out anywhere
+            args = ["worktree", "add", self.path, self.branch]
+        else:
+            args = ["worktree", "add", "-b", self.branch, self.path, self.source_ref]
+        code, _, err = self._git(*args)
+        if code != 0:
+            sys.exit(f"codewalk: could not create the worktree:\n{err}")
+
+    def _git_bytes(self, *args: str) -> bytes | None:
+        try:
+            out = subprocess.run(["git", *args], cwd=self.source,
+                                 capture_output=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
             return None
-        return candidate
+        return out.stdout if out.returncode == 0 else None
+
+    def carry(self, max_bytes: int) -> dict:
+        """Reproduce the source's uncommitted state inside the fresh worktree.
+
+        Half-finished work is the normal reason to hand a file to an agent, and asking the
+        user to commit it first is asking them to lie in their history. So the branch starts
+        at the last commit and then this puts their working state back on top of it.
+
+        Tracked changes ride over as a patch — the hunks, not the files, so the size of the
+        file they are in does not matter. Untracked files are real copies, which is the only
+        place a size cap earns its keep; `--exclude-standard` has already dropped everything
+        .gitignore covers, so what is left is small by construction unless something is wrong.
+        """
+        report = {"patched": 0, "copied": 0, "skipped": []}
+
+        patch = self._git_bytes("diff", "HEAD", "--binary")
+        if patch:
+            if len(patch) > max_bytes * 8:
+                report["skipped"].append(
+                    (f"{len(patch) // 1024} KB of tracked changes", "patch too large"))
+            else:
+                try:
+                    out = subprocess.run(
+                        ["git", "apply", "--whitespace=nowarn", "-"],
+                        cwd=self.path, input=patch, capture_output=True, timeout=60,
+                    )
+                except (OSError, subprocess.SubprocessError) as e:
+                    out = None
+                    report["skipped"].append(("tracked changes", str(e)))
+                if out is not None:
+                    if out.returncode == 0:
+                        report["patched"] = sum(
+                            1 for l in patch.split(b"\n") if l.startswith(b"--- a/"))
+                    else:
+                        report["skipped"].append(
+                            ("tracked changes",
+                             out.stderr.decode("utf-8", "replace").strip().split("\n")[0]))
+
+        raw = self._git("ls-files", "--others", "--exclude-standard", "-z")[1]
+        for rel in raw.split("\0"):
+            if not rel:
+                continue
+            # The same filter the file tree uses. `--exclude-standard` only knows what
+            # .gitignore knows, and a repo without one carries its __pycache__ straight in.
+            if os.path.splitext(rel)[1].lower() in SKIP_EXT:
+                continue
+            if any(part in SKIP_DIRS for part in rel.split("/")):
+                continue
+            src = os.path.join(self.source, rel)
+            if os.path.islink(src) or not os.path.isfile(src):
+                continue
+            try:
+                size = os.path.getsize(src)
+            except OSError:
+                continue
+            if size > max_bytes:
+                report["skipped"].append((rel, f"{size // 1024} KB, over the carry limit"))
+                continue
+            dest = os.path.join(self.path, rel)
+            try:
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                shutil.copy2(src, dest)
+                report["copied"] += 1
+            except OSError as e:
+                report["skipped"].append((rel, str(e)))
+
+        if report["patched"] or report["copied"]:
+            self._commit_carried()
+        return report
+
+    def _commit_carried(self) -> None:
+        """Pin the carried work as a commit, and diff against THAT.
+
+        Without this the user's own half-finished edits are the first thing in their
+        Changes list, attributed to an agent that has not done anything yet — which is the
+        one thing that list must never get wrong. Committing it here also makes the branch
+        honest: it holds their work, then the agent's, in that order.
+        """
+        msg = f"codewalk: uncommitted work carried from {self.source}"
+        code, _, _ = self._git("add", "-A", cwd=self.path)
+        if code != 0:
+            return
+        code, _, _ = self._git("commit", "-q", "-m", msg, cwd=self.path)
+        if code != 0:   # no committer identity configured anywhere
+            code, _, _ = self._git(
+                "-c", "user.name=codewalk", "-c", "user.email=codewalk@localhost",
+                "commit", "-q", "-m", msg, cwd=self.path)
+        if code == 0:
+            self.carried = self._git("rev-parse", "HEAD", cwd=self.path)[1]
+
+    @property
+    def base_ref(self) -> str:
+        """What the Changes list measures against: the carried state if there is one, so the
+        list starts empty and holds only what the agent did."""
+        return self.carried or self.source_ref
+
+    def _blob(self, ref: str, rel: str) -> bytes | None:
+        """The bytes of one path at one commit, or None if it was not there."""
+        try:
+            out = subprocess.run(["git", "show", f"{ref}:{rel}"], cwd=self.path,
+                                 capture_output=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return out.stdout if out.returncode == 0 else None
+
+    def _here(self, rel: str) -> bytes | None:
+        full = os.path.join(self.source, rel)
+        if not os.path.isfile(full) or os.path.islink(full):
+            return None
+        try:
+            with open(full, "rb") as fh:
+                return fh.read()
+        except OSError:
+            return None
+
+    def accept(self, entries: list[dict], baseline: str) -> dict:
+        """Commit what the agent did, then put exactly those paths into the user's checkout.
+
+        Content, not commits: the branch keeps the history, the user's repo gets working-tree
+        changes they can still read with `git diff` and take apart with `git add -p`. Nothing
+        is committed on their side, which is the whole point — they never asked for their
+        half-finished work to enter history, and this does not put it there.
+        """
+        if not entries:
+            return {"ok": False, "error": "There is nothing to accept."}
+
+        # What their checkout held at the point this diff is measured from — the carried
+        # commit at first, then whatever the last accept wrote. Anything not still matching
+        # means they edited it themselves since, and writing over that would destroy work
+        # nobody reviewed. It has to be the MOVING baseline: compare against the original
+        # fork forever and the second accept blocks every path the first one wrote.
+        blocked = [e["path"] for e in entries
+                   if self._here(e["path"]) != self._blob(baseline, e["path"])]
+        if blocked:
+            return {"ok": False, "blocked": blocked,
+                    "error": "— you edited those yourself since the last sync, so nothing "
+                             "was written. Reconcile them by hand, or discuss them here first."}
+
+        code, _, err = self._git("add", "-A", cwd=self.path)
+        if code != 0:
+            return {"ok": False, "error": f"Could not stage the branch: {err}"}
+        msg = "codewalk: " + ", ".join(e["path"] for e in entries[:4]) + \
+              (f" and {len(entries) - 4} more" if len(entries) > 4 else "")
+        code, _, err = self._git("commit", "-q", "-m", msg, cwd=self.path)
+        if code != 0:
+            code, _, err = self._git("-c", "user.name=codewalk",
+                                     "-c", "user.email=codewalk@localhost",
+                                     "commit", "-q", "-m", msg, cwd=self.path)
+        # An empty commit means the agent's work was already committed on the branch; that is
+        # fine and the restore below still has something to read.
+        sha = self._git("rev-parse", "HEAD", cwd=self.path)[1]
+
+        live = [e["path"] for e in entries if e["state"] != "deleted"]
+        gone = [e["path"] for e in entries if e["state"] == "deleted"]
+        if live:
+            code, _, err = self._git("restore", "--source", sha, "--", *live)
+            if code != 0:
+                return {"ok": False, "error": f"Could not write into {self.source}: {err}",
+                        "commit": sha}
+        removed = []
+        for rel in gone:
+            try:
+                os.remove(os.path.join(self.source, rel))
+                removed.append(rel)
+            except OSError:
+                pass
+        return {"ok": True, "commit": sha, "restored": live, "deleted": removed,
+                "source": self.source}
+
+    def hints(self) -> list[str]:
+        """What to do with it afterwards. Printed, because the answer is git commands the
+        user should not have to go and look up — and because the wrong one is destructive."""
+        return [
+            f"open it:  code {self.path}",
+            f"keep it:  press Accept in the page — it writes the agent's paths into "
+            f"{self.source} as uncommitted changes, and commits nothing there",
+            f"drop it:  git -C {self.source} worktree remove --force {self.path} "
+            f"&& git -C {self.source} branch -D {self.branch}",
+        ]
+
+
+class Changes:
+    """What the agent has proposed, read as a git diff against a base commit.
+
+    This answers the question a reviewer actually asks — what is different from where we
+    started — and it answers it from git rather than from a second copy of the tree. It
+    reads the WORKING tree, and counts untracked files too, so a change shows up whether the
+    agent committed it, staged it, or just wrote the file, and the reviewer never has to know
+    which of those happened.
+    """
+
+    def __init__(self, repo: "Repo", ref: str | None, name: str = ""):
+        self.repo = repo
+        self.ref = ref
+        self.name = name   # what to call the base in the UI, when a sha would say nothing
+        self._lock = threading.Lock()
+        self._base: str | None = None
+        self._entries: list[dict] = []
+        self._at = 0.0
+
+    # -- git -------------------------------------------------------------------
+    def _git(self, *args: str) -> str | None:
+        try:
+            out = subprocess.run(
+                ["git", *args], cwd=self.repo.root,
+                capture_output=True, text=True, errors="replace", timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return out.stdout if out.returncode == 0 else None
+
+    def base(self) -> str | None:
+        """The commit the branch grew out of. Resolved once — it does not move while a
+        review is happening, and re-resolving it mid-review would silently reframe the diff."""
+        if self._base is not None:
+            return self._base or None
+        if not self.repo.is_git:
+            self._base = ""
+            return None
+        names = [self.ref] if self.ref else ["main", "master"]
+        for name in names:
+            if not name:
+                continue
+            merged = self._git("merge-base", name, "HEAD")
+            sha = (merged or "").strip()
+            if not sha:  # not a branch we can fork from; maybe it is a raw commit
+                sha = (self._git("rev-parse", "--verify", name + "^{commit}") or "").strip()
+            if sha:
+                self._base = sha
+                return sha
+        self._base = ""
+        return None
+
+    def label(self) -> str:
+        """What to print under the list: the name asked for, plus where it landed."""
+        sha = self.base()
+        if not sha:
+            return ""
+        name = self.name or self.ref or "main/master"
+        if not self.name and sha.startswith(name):  # the ref *is* the commit; say it once
+            return sha[:8]
+        return f"{name} @ {sha[:8]}"
+
+    # -- the list --------------------------------------------------------------
+    def rebase(self, sha: str, name: str = "") -> None:
+        """Measure from here on. Called after an accept, so the list empties and then holds
+        only what the agent does next."""
+        with self._lock:
+            self.ref, self.name, self._base = sha, name, None
+            self._entries, self._at = [], 0.0
 
     def entries(self) -> list[dict]:
+        with self._lock:
+            if time.time() - self._at < 2:
+                return self._entries
+            self._entries = self._scan()
+            self._at = time.time()
+            return self._entries
+
+    def _scan(self) -> list[dict]:
+        sha = self.base()
+        if not sha:
+            return []
+        status: dict[str, str] = {}
+        raw = self._git("diff", "--name-status", "--no-renames", "-z", sha)
+        if raw is None:
+            return []
+        parts = [p for p in raw.split("\0") if p]
+        for i in range(0, len(parts) - 1, 2):
+            status[parts[i + 1]] = parts[i][:1]
+
+        counts: dict[str, tuple[int, int]] = {}
+        raw = self._git("diff", "--numstat", "--no-renames", "-z", sha) or ""
+        for rec in raw.split("\0"):
+            if not rec:
+                continue
+            bits = rec.split("\t")
+            if len(bits) != 3:
+                continue
+            add, rem, path = bits
+            # "-" means git called it binary; there is nothing to show line by line.
+            counts[path] = (int(add) if add.isdigit() else -1,
+                            int(rem) if rem.isdigit() else -1)
+
+        # A file the agent has written but never added is invisible to `git diff`, and a
+        # brand new file is the single most likely thing for it to have written. Without
+        # this the one change you most need to see is the one that does not show up.
+        raw = self._git("ls-files", "--others", "--exclude-standard", "-z") or ""
+        for path in raw.split("\0"):
+            if path and path not in status:
+                status[path] = "A"
+                counts[path] = (len(self.new_text(path).splitlines()), 0)
+
         out = []
-        for dirpath, dirnames, filenames in os.walk(self.root):
-            dirnames[:] = [d for d in dirnames if d != ".git"]
-            for fn in sorted(filenames):
-                full = os.path.join(dirpath, fn)
-                rel = os.path.relpath(full, self.root).replace(os.sep, "/")
-                try:
-                    new_text = open(full, encoding="utf-8", errors="replace").read()
-                except OSError:
-                    continue
-                base = self.repo.resolve(rel)
-                old_text = ""
-                is_new = True
-                if base and os.path.isfile(base):
-                    is_new = False
-                    try:
-                        old_text = open(base, encoding="utf-8", errors="replace").read()
-                    except OSError:
-                        old_text = ""
-                added = removed = 0
-                for line in difflib.unified_diff(
-                    old_text.splitlines(), new_text.splitlines(), n=0, lineterm=""
-                ):
-                    if line.startswith("+") and not line.startswith("+++"):
-                        added += 1
-                    elif line.startswith("-") and not line.startswith("---"):
-                        removed += 1
-                out.append({
-                    "path": rel, "new": is_new, "added": added, "removed": removed,
-                    "same": (not is_new) and old_text == new_text,
-                })
-        out.sort(key=lambda e: e["path"])
+        for path, letter in sorted(status.items()):
+            if os.path.splitext(path)[1].lower() in SKIP_EXT:
+                continue
+            if any(part in SKIP_DIRS for part in path.split("/")):
+                continue
+            add, rem = counts.get(path, (0, 0))
+            out.append({
+                "path": path,
+                "state": {"A": "new", "D": "deleted"}.get(letter, "changed"),
+                "added": add, "removed": rem,
+                "binary": add < 0,
+            })
         return out
 
-    def read(self, rel: str) -> dict:
-        full = self.resolve(rel)
+    # -- one file --------------------------------------------------------------
+    def old_text(self, rel: str) -> str:
+        sha = self.base()
+        if not sha:
+            return ""
+        return self._git("show", f"{sha}:{rel}") or ""
+
+    def new_text(self, rel: str) -> str:
+        full = self.repo.resolve(rel)
         if full is None or not os.path.isfile(full):
-            return {"error": f"No proposal for {rel}"}
+            return ""
         try:
-            text = open(full, encoding="utf-8", errors="replace").read()
-        except OSError as e:
-            return {"error": f"Could not read the proposal: {e}"}
-        base = self.repo.resolve(rel)
-        old = ""
-        is_new = True
-        if base and os.path.isfile(base):
-            is_new = False
-            try:
-                old = open(base, encoding="utf-8", errors="replace").read()
-            except OSError:
-                old = ""
-        # Mark which lines are new relative to the repo, so the pane can rail them.
-        sm = difflib.SequenceMatcher(None, old.splitlines(), text.splitlines())
-        changed = []
-        for tag, _i1, _i2, j1, j2 in sm.get_opcodes():
-            if tag in ("replace", "insert"):
-                changed.extend(range(j1 + 1, j2 + 1))
+            with open(full, encoding="utf-8", errors="replace") as fh:
+                return fh.read()
+        except OSError:
+            return ""
+
+    def read(self, rel: str) -> dict:
+        rel = rel.lstrip("/")
+        if self.repo.resolve(rel) is None:
+            return {"error": "That path is outside the project."}
+        entry = next((e for e in self.entries() if e["path"] == rel), None)
+        if entry is None:
+            return {"error": f"{rel} has not changed since {self.label() or 'the base'}."}
+        if entry["binary"]:
+            return {"error": f"{rel} is a binary file."}
+
+        old, new = self.old_text(rel), self.new_text(rel)
+        deleted = entry["state"] == "deleted"
+        # A deleted file still gets shown — as the text that would go. Otherwise the one
+        # change you cannot comment on is the most destructive one.
+        text = old if deleted else new
+        if len(text.encode("utf-8", "replace")) > MAX_BYTES:
+            return {"error": f"{rel} is too large to display."}
+
+        # A deletion is the whole file going, so splice it against nothing and every line
+        # reads as removed -- the same view, not a special case.
+        view = splice(rel, old, "" if deleted else new)
         return {
             "path": rel,
             "name": os.path.basename(rel),
             "digest": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
-            "mtime": os.path.getmtime(full),
-            "lines": tokenize(text, full),
-            "proposed": True,
-            "new": is_new,
-            "changed": changed,
-            "diff": self.diff_text(rel),
+            "mtime": self.repo.mtime(rel),
+            "state": entry["state"],
+            "deleted": deleted,
+            "base": self.label(),
+            **view,
         }
 
     def diff_text(self, rel: str) -> list[dict]:
-        """Unified diff as rows the chat/pane can render without a diff library."""
-        full = self.resolve(rel)
-        if full is None or not os.path.isfile(full):
-            return []
-        new_text = open(full, encoding="utf-8", errors="replace").read()
-        base = self.repo.resolve(rel)
-        old_text = ""
-        if base and os.path.isfile(base):
-            old_text = open(base, encoding="utf-8", errors="replace").read()
+        """Unified diff as rows the chat and the pane render without a diff library."""
+        old, new = self.old_text(rel), self.new_text(rel)
         rows = []
         for line in difflib.unified_diff(
-            old_text.splitlines(), new_text.splitlines(),
-            fromfile=rel, tofile=rel, lineterm="",
+            old.splitlines(), new.splitlines(), fromfile=rel, tofile=rel, lineterm="",
         ):
             if line.startswith("+++") or line.startswith("---"):
                 continue
@@ -318,46 +679,6 @@ class Shadow:
             )
             rows.append({"k": kind, "t": line})
         return rows
-
-    def apply(self, rel: str) -> dict:
-        """Move a proposal into the repo, backing up whatever was there."""
-        full = self.resolve(rel)
-        if full is None or not os.path.isfile(full):
-            return {"ok": False, "error": f"No proposal for {rel}"}
-        dest = self.repo.resolve(rel)
-        if dest is None:
-            return {"ok": False, "error": "That path is outside the project."}
-        try:
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            if os.path.isfile(dest):
-                shutil.copyfile(dest, dest + ".codewalk.bak")
-            shutil.copyfile(full, dest)
-            os.remove(full)
-            self._prune()
-        except OSError as e:
-            return {"ok": False, "error": f"Could not apply: {e}"}
-        return {"ok": True, "path": rel}
-
-    def discard(self, rel: str) -> dict:
-        full = self.resolve(rel)
-        if full is None or not os.path.isfile(full):
-            return {"ok": False, "error": f"No proposal for {rel}"}
-        try:
-            os.remove(full)
-            self._prune()
-        except OSError as e:
-            return {"ok": False, "error": f"Could not discard: {e}"}
-        return {"ok": True, "path": rel}
-
-    def _prune(self) -> None:
-        """Drop directories the last proposal just left behind."""
-        for dirpath, dirnames, filenames in os.walk(self.root, topdown=False):
-            if dirpath == self.root or dirnames or filenames:
-                continue
-            try:
-                os.rmdir(dirpath)
-            except OSError:
-                pass
 
 
 def tokenize(text: str, path: str) -> list[list[dict]]:
@@ -388,6 +709,61 @@ def tokenize(text: str, path: str) -> list[list[dict]]:
     if lines and not lines[-1]:
         lines.pop()
     return lines
+
+
+def splice(path: str, old_text: str, new_text: str) -> dict:
+    """Two versions of a file as ONE readable column: context, then what would go, then
+    what would arrive, in place.
+
+    The gutter numbers the file as it would be AFTER the change, and a removed line shows
+    a dash instead of a number -- one coherent run of numbers top to bottom, which is what
+    you want when the question is "what will this file look like".
+
+    Each run of difference is a hunk with an id taken from its own content, so the id
+    survives a re-render and changes the moment the hunk does. A review mark keyed by it is
+    therefore never silently carried over onto something the agent has since rewritten.
+    """
+    old = old_text.split("\n")
+    new = new_text.split("\n")
+    old_tok, new_tok = tokenize(old_text, path), tokenize(new_text, path)
+    # tokenize() drops a trailing empty line; keep the two views the same length.
+    old_tok += [[] for _ in range(len(old) - len(old_tok))]
+    new_tok += [[] for _ in range(len(new) - len(new_tok))]
+
+    ops = difflib.SequenceMatcher(None, old, new).get_opcodes()
+    # Adjacent non-equal opcodes are one change to a reader, so read them as one hunk.
+    merged: list[list] = []
+    for tag, i1, i2, j1, j2 in ops:
+        if tag != "equal" and merged and merged[-1][0] != "equal":
+            merged[-1][2], merged[-1][4] = i2, j2
+        else:
+            merged.append([tag, i1, i2, j1, j2])
+
+    lines: list = []
+    nums: list[str] = []
+    marks: list[str] = []
+    hunks: list[dict] = []
+    n = 0
+    for tag, i1, i2, j1, j2 in merged:
+        if tag == "equal":
+            for j in range(j1, j2):
+                n += 1
+                lines.append(new_tok[j]); nums.append(str(n)); marks.append("")
+            continue
+        at = len(lines)
+        for i in range(i1, i2):
+            lines.append(old_tok[i]); nums.append("−"); marks.append("del")
+        for j in range(j1, j2):
+            n += 1
+            lines.append(new_tok[j]); nums.append(str(n)); marks.append("add")
+        body = "\n".join(old[i1:i2]) + "\x00" + "\n".join(new[j1:j2])
+        hunks.append({
+            "id": hashlib.sha256((path + "\x00" + body).encode("utf-8")).hexdigest()[:12],
+            "at": at, "rows": len(lines) - at,
+            "removed": i2 - i1, "added": j2 - j1,
+            "line": n - (j2 - j1) + 1 if j2 > j1 else n + 1,
+        })
+    return {"lines": lines, "nums": nums, "marks": marks, "hunks": hunks}
 
 
 def css_class(ttype) -> str:
@@ -456,21 +832,26 @@ pane that jumps every sentence — they end up reading none of it. One or two pe
 that carry the point, and stay in that file while you talk about it. Naming a file or a function \
 in prose is often enough; open it only when they need to see the lines to follow you.
 
-2. To propose a change, write
+2. To propose a change, MAKE it. Edit the file in {root} with your tools. You are in a \
+throwaway worktree on a scratch branch, so writing a change is how a change gets proposed: \
+nothing you touch is the user's own code, and nothing reaches it until they say so.
 
-[[edit:PATH:START-END]]
-the complete replacement text for those lines
-[[/edit]]
+They read your work as a diff. Every run of change in a file gets its own bar in the centre \
+pane with accept and reject on it, so the unit they are deciding on is the hunk, not the \
+file and not the whole turn. Two consequences for how you work:
 
-which the dashboard renders as a real diff — deletions and insertions, line by line — with an \
-Apply button the user may or may not press. Give the full replacement for that line range, \
-indented exactly as it must appear in the file.
+Keep each change small and about one thing. Two unrelated fixes in adjacent lines become ONE \
+hunk they cannot take apart, and they will have to reject both to object to either.
 
-Reach for this whenever a change is what you are discussing, not only when they ask you to make \
-one. "What if this took a mask instead" is a diff; so is showing two ways to do the same thing as \
-two blocks. Seeing the exact lines that would go and the exact lines that would arrive is what \
-makes the discussion precise, and Apply stays theirs to ignore.
+When they reject one, it arrives as a REFERENCES block marked "THE USER REJECTED THIS CHANGE \
+OF YOURS", holding the exact lines that would have gone and the exact lines you wanted to put \
+there. Their note beside it may be two words. Answer about those lines, and then revise the \
+file -- do not re-explain the version they just turned down, and do not leave the old text in \
+place while arguing for it. Anything they already accepted keeps its decision as long as you \
+do not touch it, so revise narrowly.
 
+Never write [[edit:...]]. It is not applied, and a change the user cannot accept or reject is \
+not a proposal.
 
 3. Write the WHOLE answer in one reply, at the length the answer actually takes. When that is \
 long enough to need pacing, cut it into parts with
@@ -497,16 +878,16 @@ the heading on that cell, so they can scan back through the conversation and fin
 Name the specific subject, not the genre: "RevIN running statistics" or "why the mask is \
 concatenated", never "Explanation" or "Next step". Do not repeat the title in the body text.
 
-5. To draft a NEW file, or a rewrite too large to read as a diff, write it into the shadow \
-directory at {shadow}. Mirror the repo's own layout inside it: a proposed \
-src/models/encoder.py goes to {shadow}/src/models/encoder.py. The dashboard lists everything \
-there as a pending proposal the user can open, diff against the real file, and apply or discard. \
-Nothing you put there touches their code, so draft freely — but say in the chat what you wrote and \
-why, because a file appearing with no explanation is not a discussion.
+5. {root} is a git worktree on a scratch branch, not the user's own checkout. Write into it \
+freely — new files, rewrites, whole alternative versions. Nothing you do here touches the tree \
+they are working in, and none of it is permanent until they merge the branch, so draft the thing \
+rather than describing it.
 
-You may also write directly into the repo at {root}, and that is a real change to their code. Do \
-it only when they have actually agreed to that specific change; while anything is still being \
-discussed, draft it in the shadow instead. When in doubt, shadow.
+Everything you change shows up in their Changes list, against {base}, committed or not. That list \
+is how they review you, so keep it honest: no scratch files, no half-finished edits left behind \
+because you changed your mind, no reformatting a file you were not asked to touch. Every entry in \
+it should be something you would defend. And say in the chat what you wrote and why — a file \
+appearing in that list with no explanation is not a discussion.
 
 6. To show code that is NOT in the repo — a proposed new function, a sketch, a snippet from \
 elsewhere — use a fenced ``` block. That is the one place fences belong. Code that IS in the repo \
@@ -517,6 +898,15 @@ The user can attach code to a question. When they do, the exact text arrives abo
 under a REFERENCES heading, with the path and line numbers. That attached code is what they are \
 asking about — answer about it directly, and do not re-read those lines unless you need surrounding \
 context.
+
+The explorer also lists every file that differs from {base} — the work on this branch, committed or \
+not — and the user reviews it by clicking through that list. A reference marked "(your version on \
+this branch)" is code YOU wrote, quoted back at you from that review. Read it as a change request \
+about those exact lines, and expect it to be terse: "too verbose", "wrong order", "why". The path, \
+the range and the text are already in front of you, so do not ask which part they mean — they \
+attached it precisely so they would not have to say. When a change is what they are asking for, \
+make it in the file -- that is what puts it in front of them. You can open the diff view yourself \
+with [[open:@changed/PATH:START-END]].
 {brief}"""
 
 
@@ -627,11 +1017,10 @@ class Claude:
     """
 
     def __init__(self, model: str, root: str, parent: str | None = None, brief: str = "",
-                 shadow: str | None = None):
+                 ):
         self.model = model
         self.root = root
         self.parent = parent
-        self.shadow = shadow
         self.brief = (
             "\n\n=== YOUR BRIEF FOR THIS SESSION ===\n\n"
             + brief.strip()
@@ -658,8 +1047,6 @@ class Claude:
             "--allowedTools", "Read", "Grep", "Glob", "Write", "Edit", "MultiEdit",
             "--disallowedTools", "NotebookEdit", "Bash", "WebFetch", "WebSearch", "Task",
         ]
-        if self.shadow:
-            argv += ["--add-dir", self.shadow]
         if self.model:
             argv += ["--model", self.model]
         if mode == "resume" and self.session_id:
@@ -942,7 +1329,8 @@ class Handler(BaseHTTPRequestHandler):
     last_ping: float = 0.0
     sync_path: str | None = None
     synced_upto: int = 0
-    shadow: "Shadow" = None      # type: ignore[assignment]
+    changes: "Changes" = None    # type: ignore[assignment]
+    tree: "Worktree" = None      # type: ignore[assignment]
     first_question: str = ""
     models: list = []
     voice: "Voice" = None      # type: ignore[assignment]
@@ -1003,10 +1391,14 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/file":
             res = self.repo.read(self._query().get("path", ""))
             self._json(res, 200 if "error" not in res else 404)
-        elif path == "/api/proposals":
-            self._json({"items": Handler.shadow.entries(), "root": Handler.shadow.root})
-        elif path == "/api/proposal":
-            res = Handler.shadow.read(self._query().get("path", ""))
+        elif path == "/api/files":
+            self._json({"files": self.repo.files()})
+        elif path == "/api/changes":
+            self._json({"items": Handler.changes.entries(), "base": Handler.changes.label(),
+                        "accept": Handler.tree is not None,
+                        "source": Handler.tree.source if Handler.tree else ""})
+        elif path == "/api/change":
+            res = Handler.changes.read(self._query().get("path", ""))
             self._json(res, 200 if "error" not in res else 404)
         elif path == "/api/watch":
             rel = self._query().get("path", "")
@@ -1039,12 +1431,16 @@ class Handler(BaseHTTPRequestHandler):
             except (KeyError, TypeError, ValueError):
                 res = {"ok": False, "error": "Malformed edit."}
             self._json(res)
-        elif path == "/api/proposal/apply":
-            b = self._body()
-            self._json(self._proposal_bulk(b, Handler.shadow.apply))
-        elif path == "/api/proposal/discard":
-            b = self._body()
-            self._json(self._proposal_bulk(b, Handler.shadow.discard))
+        elif path == "/api/accept":
+            if Handler.tree is None:
+                self._json({"ok": False, "error": "Not running on a worktree."}, 400)
+                return
+            res = Handler.tree.accept(Handler.changes.entries(), Handler.changes.base() or "")
+            if res.get("ok"):
+                # From here the list measures against what was just accepted, so it empties
+                # and fills again only with whatever the agent does next.
+                Handler.changes.rebase(res["commit"], name="last accepted")
+            self._json(res)
         elif path == "/api/sync":
             b = self._body()
             self._json(Handler.sync(bool(b.get("close"))))
@@ -1079,26 +1475,13 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, "text/plain", b"not found")
 
-    def _proposal_bulk(self, b: dict, fn) -> dict:
-        """Run apply/discard over one path or every pending proposal."""
-        if b.get("all"):
-            paths = [e["path"] for e in Handler.shadow.entries()]
-        else:
-            paths = [str(b.get("path") or "")]
-        done, failed = [], []
-        for rel in paths:
-            res = fn(rel)
-            (done if res.get("ok") else failed).append(res.get("path") or rel)
-        return {"ok": not failed, "done": done, "failed": failed,
-                "left": len(Handler.shadow.entries())}
-
     def _system(self) -> str:
         # The brief still outranks everything; the voice note sits just above it because
         # how to phrase an answer is a smaller matter than what the answer is about.
         brief = (VOICE_NOTE + self.claude.brief) if Handler.voice_on else self.claude.brief
         return RULES.format(
             root=self.repo.root, inherited=self.claude.inherited, brief=brief,
-            shadow=Handler.shadow.root,
+            base=Handler.changes.label() or "the base commit",
         )
 
     def _ask(self, question: str, context: str):
@@ -1205,6 +1588,12 @@ PAGE = r"""<!doctype html>
   --hl-bg: rgba(215,186,125,0.09); --hl-rail: #d7ba7d; --sel-bg: rgba(0,122,204,0.20);
   --chip-bg: #3a3116;
   --add: rgba(78,201,176,0.14); --del: rgba(244,71,71,0.13);
+  /* Git status, and nothing else. Deliberately not the highlight amber: what the file's
+     state is and what is being pointed at are unrelated questions. */
+  --git-new: #4fa3e3; --git-mod: #e2a03f; --git-del: #f44747;
+  /* The user rejecting something is neither a git state nor a highlight, so it gets its
+     own colour rather than borrowing one that already means something else. */
+  --rej: rgba(197,134,192,0.20); --rej-fg: #c586c0;
   --red: #f44747; --green: #4ec9b0; --purple: #68217a;
   --mono: ui-monospace, "Cascadia Code", "Droid Sans Mono", Consolas, "Courier New", monospace;
   --ui: system-ui, "Segoe UI", Ubuntu, "Droid Sans", sans-serif;
@@ -1238,39 +1627,80 @@ body {
 #syncbar button.ghost { background: transparent; color: var(--fg-dim); border: 1px solid var(--border); }
 #syncbar button.ghost:hover:not(:disabled) { background: var(--bg-hover); color: #fff; }
 #syncnote { font-size: 11px; color: var(--green); margin-left: 2px; }
-/* The proposals list is the bottom half of the explorer, not an overlay: pending work
-   belongs next to the tree it will change, and must never cover the conversation. */
-#propPane {
-  flex: 0 0 auto; max-height: 45%; min-height: 0; display: flex; flex-direction: column;
-  border-top: 1px solid var(--border); background: var(--bg-side);
+/* Change state belongs ON the tree, not in a second list beside it: one place to look for
+   "where is the code", whether or not it has been touched. The bar is only the count and
+   the two verbs that have nowhere else to live. */
+#allGood {
+  flex: 0 0 auto; margin: 0; padding: 9px 8px; border: 0; border-top: 1px solid var(--border);
+  background: var(--btn); color: #fff; font: inherit; font-size: 11.5px; cursor: pointer;
+  letter-spacing: 0.04em;
 }
-.ptHead { display: flex; align-items: center; gap: 6px; padding: 6px 8px;
-          border-bottom: 1px solid var(--border); font-size: 10px; letter-spacing: 0.09em;
-          text-transform: uppercase; color: var(--fg-faint); }
-.ptHead b { color: var(--hl-rail); font-weight: 700; }
-.ptHead .spacer { flex: 1; }
-.ptHead .btn { font-size: 10px; padding: 2px 7px; }
-#ptList { overflow-y: auto; flex: 1 1 auto; min-height: 0; }
-.ptRow { display: flex; align-items: center; gap: 6px; padding: 5px 8px;
-         border-bottom: 1px solid #333; font-size: 11.5px; }
-.ptRow:hover { background: var(--bg-hover); }
-.ptRow .p { flex: 1; font-family: var(--mono); font-size: 11px; color: var(--fg-dim);
-            cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-            direction: rtl; unicode-bidi: plaintext; text-align: left; }
-.ptRow .p:hover { color: #fff; }
-.ptRow .tag { font-size: 9px; letter-spacing: 0.06em; text-transform: uppercase;
-              color: var(--hl-rail); }
-.ptRow .n { font-family: var(--mono); font-size: 10px; }
-.ptRow .n .a { color: var(--green); }
-.ptRow .n .r { color: var(--red); }
-.ptRow button { font: inherit; font-size: 10px; font-family: var(--ui); border: 0;
-                border-radius: 2px; padding: 1px 6px; cursor: pointer; }
-.ptRow .ok { background: var(--btn); color: #fff; }
-.ptRow .no { background: transparent; color: var(--fg-faint); border: 1px solid var(--border); }
-.ptFoot { padding: 4px 8px; font-size: 9.5px; color: var(--fg-faint);
-          font-family: var(--mono); border-top: 1px solid var(--border);
-          overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; unicode-bidi: plaintext; }
-.tab .prop { color: var(--hl-rail); font-size: 9px; letter-spacing: 0.06em; margin-left: 4px; }
+#allGood:hover { background: var(--btn-hover); }
+#allGood.warn { background: transparent; color: var(--rej-fg); border-top-color: var(--rej-fg); }
+/* The bar that opens each hunk: what it does to the file, and the two decisions. */
+/* The pane scrolls in BOTH directions, so anything laid out in the flow of the code can be
+   pushed off the side by one long line or off the top by one long hunk. The band spans the
+   content so it reads as a divider; the controls inside it are stuck to the left edge of
+   the viewport and to the top of their own hunk, which is the only way to promise they are
+   on screen when they are needed. */
+.hunk { position: relative; }
+.hbar {
+  position: sticky; top: 0; z-index: 2;
+  display: flex; align-items: center; padding: 2px 10px 2px 0;
+  font-family: var(--ui); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--fg-faint); background: var(--bg-side);
+  border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
+}
+.hbar .grp {
+  position: sticky; left: 0; display: inline-flex; align-items: center; gap: 8px;
+  padding: 1px 10px 1px 10px; background: var(--bg-side);
+}
+.hbar .l { font-family: var(--mono); letter-spacing: 0; text-transform: none;
+           min-width: 56px; color: var(--fg-dim); }
+.hbar.accept { color: var(--green); }
+.hbar.reject { color: var(--rej-fg); }
+.hbar .hb {
+  font: inherit; font-size: 10px; border: 1px solid var(--border); border-radius: 2px;
+  background: transparent; color: var(--fg-dim); padding: 1px 7px; cursor: pointer;
+}
+.hbar .hb:hover { background: var(--bg-hover); color: #fff; }
+.hbar .hb.ok:hover { border-color: var(--green); color: var(--green); }
+.hbar .hb.no:hover { border-color: var(--rej-fg); color: var(--rej-fg); }
+/* A rejected hunk stays on screen and changes hands: it stops being the agent's proposal
+   and becomes something the user is pointing at, the way a Ctrl-L selection is. */
+.ln.rv-reject { background: var(--rej); border-left-color: var(--rej-fg); }
+.ln.rv-accept.add { background: rgba(78,201,176,0.07); }
+.ln.rv-accept.del { background: transparent; }
+.ln.rv-accept.del .no { color: #4a4a4a; }
+.ln.rv-accept.del .src, .ln.rv-accept.del .src span {
+  color: #5a5a5a; text-decoration: line-through; text-decoration-thickness: 1px;
+}
+/* A changed file reads as changed at a glance: the dot carries the state, the name brightens,
+   and the counts sit at the end where they do not push the name around. */
+/* The dot carries one meaning: what git says about this file. An untouched file has no
+   dot at all, so a coloured one always means something happened. */
+.node .dot, .tab .dot { background: transparent; }
+.node.file.chg .dot, .tab .dot.chg { background: var(--git-mod); }
+.node.file.chg-new .dot, .tab .dot.chg-new { background: var(--git-new); }
+.node.file.chg-deleted .dot, .tab .dot.chg-deleted { background: var(--git-del); }
+.node.file.chg .lbl { color: #fff; }
+.node.file.chg-deleted .lbl { text-decoration: line-through; text-decoration-thickness: 1px;
+                              color: var(--fg-dim); }
+/* The proposal view: what would go, then what would arrive, in the real file around them. */
+/* Tinted background, untouched foreground: the code stays as legible as it is in the file
+   itself, and the tint is the only thing the diff adds. */
+.ln.del { background: var(--del); }
+.ln.add { background: var(--add); }
+.ln.del .no, .ln.add .no { color: var(--fg-dim); }
+.node .num { margin-left: auto; padding-left: 8px; font-family: var(--mono); font-size: 9.5px; }
+.node .num .a { color: var(--green); }
+.node .num .r { color: var(--red); }
+/* A collapsed directory still has to say that something inside it moved. */
+.node.dir.chg > .lbl { color: #fff; }
+.node.dir.chg > .lbl::after {
+  content: "\2022"; color: var(--git-mod); font-size: 14px; margin-left: 6px; vertical-align: middle;
+}
+.tab .state { color: var(--hl-rail); font-size: 9px; letter-spacing: 0.06em; margin-left: 4px; }
 .titlebar .center { flex: 1; text-align: center; color: var(--fg-faint); }
 
 .main { flex: 1 1 auto; display: flex; min-height: 0; }
@@ -1451,6 +1881,9 @@ select.iconbtn { padding: 2px 4px; text-transform: none; letter-spacing: 0; }
   background: #1e3a5f; color: #9cdcfe; border: 1px solid #2d5a8c; border-radius: 2px;
   padding: 2px 4px 2px 7px; max-width: 100%;
 }
+.ref.reject { background: #3a1e38; color: var(--rej-fg); border-color: #6b3a67; }
+.ref.reject .x { color: #a06a9c; }
+.ref.reject .x:hover { background: #6b3a67; }
 .ref .lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
 .ref .lbl:hover { color: #cfe8ff; }
 .ref .x { cursor: pointer; color: #6f9dc9; padding: 0 2px; border-radius: 2px; font-size: 13px; line-height: 1; }
@@ -1489,11 +1922,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
     <div class="paneHead"><span id="expName">Explorer</span><span class="spacer"></span><span class="dim" id="fileCount" style="text-transform:none;letter-spacing:0"></span></div>
     <input id="filter" type="search" placeholder="Filter files…" aria-label="Filter files">
     <div id="tree"></div>
-    <div id="propPane" hidden>
-      <div class="ptHead"><span>Proposed <b id="propN">0</b></span><span class="spacer"></span><button id="ptAll" class="btn">Apply all</button><button id="ptNone" class="btn ghost">Discard</button></div>
-      <div id="ptList"></div>
-      <div class="ptFoot" id="ptFoot"></div>
-    </div>
+    <button id="allGood" hidden>All Good</button>
   </section>
 
   <div class="sash" id="sash1" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize explorer"></div>
@@ -1549,11 +1978,6 @@ textarea:focus { outline: none; border-color: var(--accent); }
 
   let allFiles = [], openTabs = [], active = null, busy = false, watchToken = 0;
 
-  const DOT = { py: "#4b8bbe", js: "#e6c07b", ts: "#3178c6", jsx: "#e6c07b", tsx: "#3178c6",
-    md: "#6a9955", json: "#cbcb41", yml: "#cb4141", yaml: "#cb4141", toml: "#cbcb41",
-    html: "#e34c26", css: "#563d7c", sh: "#89e051", rs: "#dea584", go: "#00add8",
-    c: "#555555", h: "#555555", cpp: "#f34b7d", cu: "#76b900", ipynb: "#da5b0b" };
-  const dotColor = (p) => DOT[(p.split(".").pop() || "").toLowerCase()] || "#6e7681";
 
   // ---------------- tree ----------------
   const expanded = new Set([""]);
@@ -1572,12 +1996,23 @@ textarea:focus { outline: none; border-color: var(--accent); }
     return root;
   }
 
+  // The tree is `git ls-files` plus whatever the changes list knows that it does not.
+  // A deleted file is gone from disk so git cannot report it at all; a newly written one
+  // is real but was not there when the list was last fetched. Both would otherwise be
+  // invisible — and they are the two states you most need to see.
+  function treeFiles() {
+    const seen = new Set(allFiles);
+    const extra = chgItems.map((e) => e.path).filter((p) => !seen.has(p));
+    return extra.length ? allFiles.concat(extra).sort() : allFiles;
+  }
+
   function renderTree() {
     const q = $("filter").value.trim().toLowerCase();
     const el = $("tree");
+    const files = treeFiles();
     el.textContent = "";
     if (q) {
-      const hits = allFiles.filter((p) => p.toLowerCase().includes(q)).slice(0, 400);
+      const hits = files.filter((p) => p.toLowerCase().includes(q)).slice(0, 400);
       $("fileCount").textContent = hits.length + (hits.length === 400 ? "+" : "") + " match";
       for (const p of hits) el.appendChild(fileNode(p, p, 0));
       if (!hits.length) {
@@ -1588,8 +2023,8 @@ textarea:focus { outline: none; border-color: var(--accent); }
       }
       return;
     }
-    $("fileCount").textContent = allFiles.length + " files";
-    el.appendChild(dirBody(buildTree(allFiles), "", 0));
+    $("fileCount").textContent = files.length + " files";
+    el.appendChild(dirBody(buildTree(files), "", 0));
   }
 
   function dirBody(node, prefix, depth) {
@@ -1598,7 +2033,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
       const full = prefix ? prefix + "/" + name : name;
       const open = expanded.has(full);
       const row = document.createElement("div");
-      row.className = "node dir";
+      row.className = "node dir" + (chgUnder(full) ? " chg" : "");
       row.style.paddingLeft = 8 + depth * 12 + "px";
       const tw = document.createElement("span");
       tw.className = "tw";
@@ -1621,21 +2056,42 @@ textarea:focus { outline: none; border-color: var(--accent); }
   }
 
   function fileNode(path, label, depth) {
+    const ch = chgAt(path);
     const row = document.createElement("div");
-    row.className = "node file" + (active === path ? " active" : "");
+    row.className = "node file"
+      + (active === path || active === CHG + path ? " active" : "")
+      + (ch ? " chg chg-" + ch.state : "");
     row.style.paddingLeft = 8 + depth * 12 + "px";
     row.dataset.path = path;
     const tw = document.createElement("span");
     tw.className = "tw";
     const dot = document.createElement("span");
     dot.className = "dot";
-    dot.style.background = dotColor(path);
     const lbl = document.createElement("span");
     lbl.className = "lbl";
     lbl.textContent = label;
     row.append(tw, dot, lbl);
-    row.onclick = () => openFile(path);
+    if (ch && !ch.binary) {
+      const n = document.createElement("span");
+      n.className = "num";
+      const a = document.createElement("span"); a.className = "a"; a.textContent = "+" + ch.added;
+      const r = document.createElement("span"); r.className = "r"; r.textContent = " -" + ch.removed;
+      n.append(a, r);
+      row.appendChild(n);
+      row.title = ch.state + " \u00b7 open the diff";
+    }
+    // A changed file opens as its diff. The plain file is still one click away on the tab.
+    row.onclick = () => openFile(ch ? CHG + path : path);
     return row;
+  }
+
+  // Rebuilt whenever the changes list is refetched; the tree reads it on every render.
+  let chgByPath = new Map();
+  function chgAt(path) { return chgByPath.get(path) || null; }
+  function chgUnder(dir) {
+    const pre = dir + "/";
+    for (const p of chgByPath.keys()) if (p.startsWith(pre)) return true;
+    return false;
   }
 
   function expandTo(path) {
@@ -1692,13 +2148,15 @@ textarea:focus { outline: none; border-color: var(--accent); }
 
   async function openFile(path, spec, focus) {
     let t = tab(path);
-    const isProp = path.startsWith(PROP);
+    // A changed file is a git-side view, not a tree entry: it may not exist on disk at all
+    // (a deletion), and there is nothing to watch for local edits.
+    const isChg = path.startsWith(CHG);
     if (!t) {
-      const rel = isProp ? path.slice(PROP.length) : path;
-      const url = (isProp ? "/api/proposal?path=" : "/api/file?path=") + encodeURIComponent(rel);
+      const rel = isChg ? path.slice(CHG.length) : path;
+      const url = (isChg ? "/api/change?path=" : "/api/file?path=") + encodeURIComponent(rel);
       const data = await fetch(url).then((r) => r.json());
       if (data.error) { flash(data.error); return null; }
-      t = { path: path, data: data, hl: new Set(), sel: null, scroll: 0, prop: isProp };
+      t = { path: path, data: data, hl: new Set(), sel: null, scroll: 0, chg: isChg };
       openTabs.push(t);
     }
     if (active && active !== path) {
@@ -1707,16 +2165,17 @@ textarea:focus { outline: none; border-color: var(--accent); }
     }
     active = path;
     if (spec) { t.hl = parseSpec(spec); }
-    // Opening a proposal rails exactly the lines that differ from the repo.
-    else if (isProp && t.data.changed && !t.hl.size) t.hl = new Set(t.data.changed);
-    // A proposal has no place in the repo tree and nothing to watch on disk.
-    if (!isProp) {
+    if (!isChg) {
       expandTo(path);
       renderTree();
     }
     renderTabs();
+    // A changed file opens ON its first change. That is the whole point of the list:
+    // clicking a row should land the eye on the edit, not at line 1 of a long file.
+    // A proposal opens on its hunk for the same reason a changed file does.
     renderCode(t, !!spec);
-    if (!isProp) watchFile(t);
+    if (!isChg) watchFile(t);
+    if (chgItems.length) renderTree();
     pushHist(path, spec);
     return t;
   }
@@ -1741,14 +2200,15 @@ textarea:focus { outline: none; border-color: var(--accent); }
       const d = document.createElement("div");
       d.className = "tab" + (t.path === active ? " active" : "");
       const dot = document.createElement("span");
-      dot.className = "dot"; dot.style.background = dotColor(t.path);
+      const st = chgAt(realPath(t.path));
+      dot.className = "dot" + (st ? " chg chg-" + st.state : "");
       dot.style.width = "6px"; dot.style.height = "6px"; dot.style.borderRadius = "50%"; dot.style.display = "inline-block";
       const n = document.createElement("span");
       n.textContent = t.data.name;
-      if (t.prop) {
+      if (t.chg) {
         const pr = document.createElement("span");
-        pr.className = "prop";
-        pr.textContent = t.data.new ? "NEW" : "PROPOSED";
+        pr.className = "state";
+        pr.textContent = String(t.data.state || "changed").toUpperCase();
         n.appendChild(pr);
       }
       const x = document.createElement("span");
@@ -1764,13 +2224,32 @@ textarea:focus { outline: none; border-color: var(--accent); }
     $("empty").hidden = true;
     codeEl.textContent = "";
     const frag = document.createDocumentFragment();
+    const rh = t.data.hunks ? rowHunks(t) : null;
+    // Rows of a hunk go inside a box of their own. A sticky bar is held by its parent, so
+    // the box is what makes the bar ride along at the top of the pane for exactly as long
+    // as its hunk is in view, and no longer.
+    let into = frag;
     t.data.lines.forEach((segs, i) => {
       const n = i + 1;
+      // The gutter numbers the file as it would be after the change; a removed line shows
+      // a dash. dataset.n stays the array index so selection, Ctrl-L and the scroll below
+      // keep working on what is actually displayed.
+      const mark = t.data.marks ? t.data.marks[i] : "";
+      const h = rh ? rh[i] : null;
+      const st = h ? (review.get(h.id) || "") : "";
+      if (h && h.at === i) {
+        into = document.createElement("div");
+        into.className = "hunk";
+        into.appendChild(hunkBar(t, h));
+        frag.appendChild(into);
+      }
       const row = document.createElement("div");
-      row.className = "ln" + (t.hl.has(n) ? " hl" : "") + (t.sel && n >= t.sel.a && n <= t.sel.b ? " sel" : "");
+      row.className = "ln" + (mark ? " " + mark : "") + (st ? " rv-" + st : "")
+        + (t.hl.has(n) ? " hl" : "") + (t.sel && n >= t.sel.a && n <= t.sel.b ? " sel" : "");
       row.dataset.n = String(n);
       const no = document.createElement("span");
-      no.className = "no"; no.textContent = String(n);
+      no.className = "no";
+      no.textContent = t.data.nums ? t.data.nums[i] : String(n);
       const src = document.createElement("span");
       src.className = "src";
       if (!segs.length) src.appendChild(document.createTextNode("​"));
@@ -1779,7 +2258,8 @@ textarea:focus { outline: none; border-color: var(--accent); }
         else src.appendChild(document.createTextNode(s.t));
       }
       row.append(no, src);
-      frag.appendChild(row);
+      into.appendChild(row);
+      if (h && i === h.at + h.rows - 1) into = frag;
     });
     codeEl.appendChild(frag);
 
@@ -1796,7 +2276,12 @@ textarea:focus { outline: none; border-color: var(--accent); }
     $("clearHl").disabled = !t.hl.size;
     paintSel();
 
-    if (scrollToHl && t.hl.size) {
+    // A diff view aims at its first hunk. Landing at line 1 of a long file and making the
+    // reader hunt is the thing this list exists to prevent.
+    if (!scrollToHl && t.data.hunks && t.data.hunks.length) {
+      const bar = codeEl.querySelector(".hbar");
+      if (bar) bar.scrollIntoView({ block: "center" });
+    } else if (scrollToHl && t.hl.size) {
       const first = codeEl.querySelector('.ln[data-n="' + Math.min.apply(null, Array.from(t.hl)) + '"]');
       if (first) first.scrollIntoView({ block: "center", behavior: "smooth" });
     } else {
@@ -1897,12 +2382,26 @@ textarea:focus { outline: none; border-color: var(--accent); }
   }
 
   function refLabel(r) {
-    return shortPath(r.path) + ":" + (r.a === r.b ? r.a : r.a + "-" + r.b);
+    const where = shortPath(realPath(r.path)) + ":" + (r.a === r.b ? r.a : r.a + "-" + r.b);
+    return r.reject ? "rejected \u00b7 " + where : where;
+  }
+
+  // The model must never have to guess which text it is being shown. A line range means
+  // nothing without the tree it came from, and these two are the whole reason attaching
+  // beats typing: the user says "too verbose", and the path, the range, the exact text and
+  // the version it belongs to are filled in around those two words.
+  function realPath(p) {
+    return p.startsWith(CHG) ? p.slice(CHG.length) : p;
+  }
+
+  function srcNote(p) {
+    if (!p.startsWith(CHG)) return "";
+    return " (your version on this branch" + (chgBase ? ", changed vs " + chgBase : "") + ")";
   }
 
   function refChip(r, onRemove) {
     const el = document.createElement("span");
-    el.className = "ref";
+    el.className = "ref" + (r.reject ? " reject" : "");
     const lbl = document.createElement("span");
     lbl.className = "lbl";
     lbl.textContent = refLabel(r);
@@ -1924,7 +2423,15 @@ textarea:focus { outline: none; border-color: var(--accent); }
     bar.textContent = "";
     bar.hidden = !refs.length;
     refs.forEach((r, i) => {
-      bar.appendChild(refChip(r, () => { refs.splice(i, 1); renderRefs(); }));
+      bar.appendChild(refChip(r, () => {
+        // Closing the box IS undoing the rejection -- two ways to say the same thing that
+        // disagreed would be worse than either.
+        if (r.hunk) review.delete(r.hunk);
+        refs.splice(i, 1);
+        renderRefs();
+        const t = tab(active); if (t) renderCode(t, false);
+        updateAllGood();
+      }));
     });
   }
 
@@ -2046,7 +2553,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
     EDIT_RE.lastIndex = 0;
     while ((m = EDIT_RE.exec(text))) {
       prose(el, text.slice(cursor, m.index));
-      el.appendChild(diffCard(m[1], Number(m[2]), Number(m[3]), m[4].replace(/\n$/, "")));
+      el.appendChild(strayEdit(m[1], Number(m[2]), Number(m[3]), m[4].replace(/\n$/, "")));
       cursor = m.index + m[0].length;
     }
     const tail = text.slice(cursor);
@@ -2166,6 +2673,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
       chip.className = "chip";
       chip.textContent = label ? label + " \u00b7 " + shortPath(path) + (spec ? ":" + spec : "")
                                : shortPath(path) + (spec ? ":" + spec : "");
+      chip.dataset.key = chipKey(path, spec);
       chip.onclick = () => {
         const body = chip.closest(".body");
         if (body) body.querySelectorAll(".chip").forEach((c) => c.classList.remove("active"));
@@ -2184,23 +2692,40 @@ textarea:focus { outline: none; border-color: var(--accent); }
     return /[A-Za-z0-9_]/.test(v) && !/\s/.test(v);
   }
 
+  // Everywhere the pane should go, in the order the answer says to go there. An [[edit:]]
+  // counts: a proposed change is a place in the code, and the reader should not have to
+  // click anything to be shown the thing being discussed.
   function allDirectives(text) {
     const out = [];
-    const bare = text.replace(/`[^`\n]+`/g, "");   // ignore anything inside inline code
-    OPEN_RE.lastIndex = 0;
+    // Blank inline code to the same LENGTH, so both scans index the same string and the
+    // sort below really is document order.
+    const bare = text.replace(/`[^`\n]+`/g, (q) => " ".repeat(q.length));
     let m;
+    OPEN_RE.lastIndex = 0;
     while ((m = OPEN_RE.exec(bare))) {
-      if (isPath(m[1])) out.push({ path: m[1], spec: m[2] || "" });
+      if (isPath(m[1])) out.push({ at: m.index, path: m[1], spec: m[2] || "" });
     }
+    out.sort((a, b) => a.at - b.at);
     return out;
   }
 
-  function markActiveChip(scope, idx) {
+  // Chips are marked by WHERE THEY POINT, not by their position in the message. Two
+  // things walk this list -- the auto-follow and the narrator -- and they count
+  // differently (the narrator speaks over edits rather than stopping on them), so a
+  // numeric index quietly lit the wrong chip as soon as an edit preceded an open.
+  function chipKey(path, spec) { return path + "#" + (spec || ""); }
+
+  function markActiveChip(scope, key) {
     const chips = scope.querySelectorAll(".chip");
-    chips.forEach((c, i) => c.classList.toggle("active", i === idx));
-    if (idx >= 0 && chips[idx]) {
-      const r = chips[idx].getBoundingClientRect(), lr = logEl.getBoundingClientRect();
-      if (r.top < lr.top || r.bottom > lr.bottom) chips[idx].scrollIntoView({ block: "nearest" });
+    let hit = null;
+    chips.forEach((c) => {
+      const on = key != null && c.dataset.key === key;
+      c.classList.toggle("active", on);
+      if (on) hit = c;
+    });
+    if (hit) {
+      const r = hit.getBoundingClientRect(), lr = logEl.getBoundingClientRect();
+      if (r.top < lr.top || r.bottom > lr.bottom) hit.scrollIntoView({ block: "nearest" });
     }
   }
 
@@ -2221,69 +2746,6 @@ textarea:focus { outline: none; border-color: var(--accent); }
     }
   }
 
-  function diffCard(path, start, end, replacement) {
-    const card = document.createElement("div");
-    card.className = "diff";
-    const head = document.createElement("div");
-    head.className = "head";
-    const title = document.createElement("span");
-    title.textContent = shortPath(path) + " · lines " + start + "–" + end;
-    const spacer = document.createElement("span");
-    spacer.className = "spacer";
-    const show = document.createElement("button");
-    show.className = "btn ghost"; show.textContent = "Show";
-    show.onclick = () => openFile(path, start + "-" + end);
-    const apply = document.createElement("button");
-    apply.className = "btn"; apply.textContent = "Apply";
-    head.append(title, spacer, show, apply);
-
-    const pre = document.createElement("pre");
-    for (const l of replacement.split("\n")) {
-      const d = document.createElement("div");
-      d.className = "d plus"; d.textContent = "+ " + l;
-      pre.appendChild(d);
-    }
-    // fill in the removed lines once we have the file
-    fetch("/api/file?path=" + encodeURIComponent(path)).then((r) => r.json()).then((data) => {
-      if (data.error) return;
-      card.dataset.digest = data.digest;
-      const olds = data.lines.slice(start - 1, end)
-        .map((segs) => segs.map((s) => s.t).join(""));
-      const first = pre.firstChild;
-      for (const l of olds) {
-        const d = document.createElement("div");
-        d.className = "d minus"; d.textContent = "- " + l;
-        pre.insertBefore(d, first);
-      }
-    });
-
-    apply.onclick = async () => {
-      apply.disabled = true; apply.textContent = "Applying…";
-      try {
-        const res = await fetch("/api/apply", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ path: path, start: start, end: end, text: replacement, digest: card.dataset.digest || "" }),
-        }).then((r) => r.json());
-        if (res.ok) {
-          apply.textContent = "Applied";
-          title.textContent = "applied · " + shortPath(path);
-          const t = tab(path);
-          if (t) t.data = await fetch("/api/file?path=" + encodeURIComponent(path)).then((r) => r.json());
-          await openFile(path, start + "-" + (start + res.added - 1));
-        } else {
-          apply.textContent = "Apply"; apply.disabled = false;
-          const e = document.createElement("div");
-          e.className = "errline"; e.textContent = res.error;
-          card.appendChild(e);
-        }
-      } catch (err) {
-        apply.textContent = "Apply"; apply.disabled = false;
-      }
-    };
-    card.append(head, pre);
-    return card;
-  }
-
   // ---------------- chat ----------------
   function bubble(who, cls) {
     const m = document.createElement("div");
@@ -2297,84 +2759,265 @@ textarea:focus { outline: none; border-color: var(--accent); }
     return m;
   }
 
-  // ---------------- proposals ----------------
-  // Files the agent drafted in the shadow tree. They are real files on disk, but outside
-  // the repo, so nothing the user is reading changes until they say so here.
-  const PROP = "@proposed/";
-  let propItems = [];
+  // ---------------- changes ----------------
+  // The branch, read as a diff against where it grew from. This is the review surface, and
+  // since the agent works in a throwaway worktree it is the ONLY one: making a change is
+  // how a change gets proposed, so there is nothing to show that is not already here.
+  const CHG = "@changed/";
+  let chgItems = [];
+  let chgBase = "";
+  let chgSource = "";   // the checkout All Good writes into; empty when there is no worktree
+  let chgAccept = false;
 
-  async function refreshProposals() {
+  async function refreshChanges() {
     let d = null;
-    try { d = await fetch("/api/proposals").then((r) => r.json()); } catch (e) { return; }
-    propItems = d.items || [];
-    // The section simply is not there when nothing is pending — no empty state to ignore.
-    $("propPane").hidden = propItems.length === 0;
-    $("propN").textContent = propItems.length;
-    $("ptFoot").textContent = d.root || "";
-    renderProposals();
+    try {
+      const [c, f] = await Promise.all([
+        fetch("/api/changes").then((r) => r.json()),
+        // The agent writes real files; the tree it was handed at boot does not know them.
+        fetch("/api/files").then((r) => r.json()).catch(() => null),
+      ]);
+      d = c;
+      if (f && f.files) allFiles = f.files;
+    } catch (e) { return; }
+    chgItems = d.items || [];
+    chgBase = d.base || "";
+    chgSource = d.source || "";
+    chgAccept = !!d.accept;
+    chgByPath = new Map(chgItems.map((e) => [e.path, e]));
+    renderTree();
+    await refreshOpenDiffs();
+    updateAllGood();
   }
 
-  function renderProposals() {
-    const list = $("ptList");
-    list.textContent = "";
-    for (const it of propItems) {
-      const row = document.createElement("div");
-      row.className = "ptRow";
-
-      const p = document.createElement("span");
-      p.className = "p";
-      p.textContent = it.path;
-      p.title = "Open this proposal in the editor";
-      p.onclick = () => openFile(PROP + it.path);
-
-      const tag = document.createElement("span");
-      tag.className = "tag";
-      tag.textContent = it.new ? "new" : (it.same ? "identical" : "changed");
-
-      const n = document.createElement("span");
-      n.className = "n";
-      if (!it.new) {
-        const a = document.createElement("span"); a.className = "a"; a.textContent = "+" + it.added;
-        const r = document.createElement("span"); r.className = "r"; r.textContent = " -" + it.removed;
-        n.append(a, r);
+  // The agent revising a file while its diff is open is the NORMAL case -- it is what
+  // happens every time a rejection gets answered. The view has to follow, or the reader is
+  // studying an argument that has already moved on. Marks look after themselves: a hunk the
+  // agent did not touch keeps its content hash and so keeps its decision, and only the one
+  // that was rewritten comes back unreviewed.
+  async function refreshOpenDiffs() {
+    for (const t of openTabs.filter((x) => x.chg)) {
+      const rel = realPath(t.path);
+      if (!chgByPath.has(rel)) continue;
+      let d = null;
+      try {
+        d = await fetch("/api/change?path=" + encodeURIComponent(rel)).then((r) => r.json());
+      } catch (e) { continue; }
+      if (!d || d.error || d.digest === t.data.digest) continue;
+      t.data = d;
+      if (t.path === active) {
+        const sc = $("scroll"), at = sc.scrollTop;
+        renderCode(t, false);
+        sc.scrollTop = at;
       }
-
-      const ok = document.createElement("button");
-      ok.className = "ok"; ok.textContent = "Apply";
-      ok.onclick = () => propAct("/api/proposal/apply", { path: it.path });
-
-      const no = document.createElement("button");
-      no.className = "no"; no.textContent = "Discard";
-      no.onclick = () => propAct("/api/proposal/discard", { path: it.path });
-
-      row.append(p, tag, n, ok, no);
-      list.appendChild(row);
+    }
+    // A rejection box whose hunk no longer exists is pointing at code that is gone -- which
+    // is exactly what happens when the agent acts on the rejection.
+    const live = new Set();
+    for (const { hunk } of openHunks()) live.add(hunk.id);
+    const stale = refs.filter((r) => r.hunk && !live.has(r.hunk));
+    if (stale.length) {
+      for (const r of stale) review.delete(r.hunk);
+      refs = refs.filter((r) => !r.hunk || live.has(r.hunk));
+      renderRefs();
     }
   }
 
-  async function propAct(url, body) {
+  // The one thing in this page that changes something outside the worktree. All Good has
+  // already decided whether it should run; this just does it.
+  async function acceptChanges() {
+    if (!chgItems.length) return;
+    const btn = $("allGood");
+    btn.disabled = true;
     let res = null;
     try {
-      res = await fetch(url, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      }).then((r) => r.json());
-    } catch (e) { flash("Could not reach the server."); return; }
-    if (res && res.failed && res.failed.length) flash("Failed: " + res.failed.join(", "));
-    // Applied files change the repo underneath any tab showing them.
-    for (const t of openTabs.slice()) {
-      if (t.path.startsWith(PROP)) closeTab(t.path);
+      res = await fetch("/api/accept", { method: "POST" }).then((r) => r.json());
+    } catch (e) {
+      btn.disabled = false; flash("Could not reach the server."); return;
     }
-    for (const t of openTabs.slice()) {
-      if ((res.done || []).includes(t.path)) { closeTab(t.path); openFile(t.path); }
+    btn.disabled = false;
+    if (!res.ok) {
+      flash(res.blocked ? "Not written — " + res.blocked.join(", ") + " " + res.error
+                        : (res.error || "Could not write the changes."));
+      return;
     }
-    refreshProposals();
+    const n = res.restored.length + res.deleted.length;
+    flash(n + " path(s) written into " + res.source + " as uncommitted changes");
+    btn.textContent = "All Good";
+    for (const t of openTabs.slice()) if (t.path.startsWith(CHG)) closeTab(t.path);
+    refreshChanges();
   }
 
-  function setupProposals() {
-    $("ptAll").onclick = () => propAct("/api/proposal/apply", { all: true });
-    $("ptNone").onclick = () => propAct("/api/proposal/discard", { all: true });
-    refreshProposals();
+  // An [[edit:]] block, which nothing is supposed to emit any more: the agent works in a
+  // worktree, so making a change IS proposing it and the Changes view is where it is read.
+  // Rendered rather than dropped, because silently swallowing code it wrote would be worse.
+  function strayEdit(path, start, end, replacement) {
+    const box = document.createElement("div");
+    box.className = "diff";
+    const head = document.createElement("div");
+    head.className = "head";
+    head.textContent = shortPath(path) + " \u00b7 lines " + start + "\u2013" + end
+                     + " \u00b7 not applied";
+    const pre = document.createElement("pre");
+    for (const l of replacement.split("\n")) {
+      const d = document.createElement("div");
+      d.className = "d plus"; d.textContent = l;
+      pre.appendChild(d);
+    }
+    box.append(head, pre);
+    return box;
+  }
+
+  // ---------------- reviewing hunk by hunk ----------------
+  // One decision per hunk, held here and nowhere else: nothing is written to the user's
+  // repo until All Good. That is what makes un-accepting free -- it is unmarking, not
+  // undoing. The key is the hunk's content hash, so the moment the agent rewrites a hunk
+  // its id changes and any mark on the old one falls away instead of quietly transferring
+  // to code nobody looked at.
+  const review = new Map();   // hunk id -> "accept" | "reject"
+
+  function rowHunks(t) {
+    const out = new Array(t.data.lines.length).fill(null);
+    for (const h of (t.data.hunks || [])) {
+      for (let i = h.at; i < h.at + h.rows && i < out.length; i++) out[i] = h;
+    }
+    return out;
+  }
+
+  // Every hunk on screen right now, with the file it belongs to.
+  function openHunks() {
+    const out = [];
+    for (const t of openTabs) {
+      for (const h of (t.data.hunks || [])) out.push({ tab: t, hunk: h });
+    }
+    return out;
+  }
+
+  function hunkLabel(t, h) {
+    return shortPath(realPath(t.path)) + ":" + h.line;
+  }
+
+  function hunkBar(t, h) {
+    const st = review.get(h.id) || "";
+    const bar = document.createElement("div");
+    bar.className = "hbar" + (st ? " " + st : "");
+    // Everything lives in the sticky group, not in the band: the band is only the divider.
+    const grp = document.createElement("span");
+    grp.className = "grp";
+    bar.appendChild(grp);
+    const lbl = document.createElement("span");
+    lbl.className = "l";
+    lbl.textContent = st === "accept" ? "accepted" : st === "reject" ? "rejected"
+                    : "−" + h.removed + " +" + h.added;
+    grp.appendChild(lbl);
+
+    if (st) {
+      const undo = document.createElement("button");
+      undo.className = "hb";
+      undo.textContent = "undo";
+      undo.onclick = () => setReview(t, h, null);
+      grp.appendChild(undo);
+    } else {
+      const ok = document.createElement("button");
+      ok.className = "hb ok"; ok.textContent = "✓ accept";
+      ok.onclick = () => setReview(t, h, "accept");
+      const no = document.createElement("button");
+      no.className = "hb no"; no.textContent = "✗ reject";
+      no.onclick = () => setReview(t, h, "reject");
+      grp.append(ok, no);
+    }
+    return bar;
+  }
+
+  function setReview(t, h, state) {
+    const was = review.get(h.id) || null;
+    if (state) review.set(h.id, state); else review.delete(h.id);
+    if (was === "reject" && state !== "reject") dropRejectRef(h.id);
+    if (state === "reject") addRejectRef(t, h);
+    // renderCode rebuilds the pane and restores the tab's REMEMBERED scroll, which is not
+    // where the reader is standing. Deciding on a hunk must not move the page out from
+    // under the button that was just pressed.
+    const sc = $("scroll"), at = sc.scrollTop;
+    renderCode(t, false);
+    sc.scrollTop = at;
+    renderTree();
+    updateAllGood();
+  }
+
+  // A rejected hunk becomes exactly what Ctrl-L produces: a box over the composer holding
+  // the code and where it is, so the note you type next to it can be two words. Reject one
+  // and say why, or reject five and answer them all in one message.
+  function addRejectRef(t, h) {
+    const path = realPath(t.path);
+    if (refs.some((r) => r.hunk === h.id)) return;
+    const body = [];
+    for (let i = h.at; i < h.at + h.rows; i++) {
+      const mk = t.data.marks[i];
+      body.push((mk === "del" ? "- " : mk === "add" ? "+ " : "  ")
+                + t.data.lines[i].map((x) => x.t).join(""));
+    }
+    refs.push({ path: path, a: h.line, b: h.line + Math.max(0, h.added - 1),
+                text: body.join("\n"), clipped: false, hunk: h.id, reject: true });
+    renderRefs();
+    boxEl.focus();
+  }
+
+  function dropRejectRef(id) {
+    const i = refs.findIndex((r) => r.hunk === id);
+    if (i >= 0) { refs.splice(i, 1); renderRefs(); }
+  }
+
+  // All Good is the only thing that writes. It refuses while a rejection is outstanding --
+  // a rejection is feedback that has not been sent, and shipping the code anyway would make
+  // the button a lie -- and it asks first if anything was never looked at.
+  function reviewState() {
+    const all = openHunks();
+    const known = new Set();
+    const unseen = [], rejected = [];
+    for (const { tab, hunk } of all) {
+      if (known.has(hunk.id)) continue;
+      known.add(hunk.id);
+      const st = review.get(hunk.id);
+      if (st === "reject") rejected.push(hunkLabel(tab, hunk));
+      else if (!st) unseen.push(hunkLabel(tab, hunk));
+    }
+    return { unseen: unseen, rejected: rejected };
+  }
+
+  function updateAllGood() {
+    const btn = $("allGood");
+    if (!btn) return;
+    btn.hidden = !chgItems.length || !chgAccept;
+    const n = refs.filter((r) => r.reject).length;
+    btn.textContent = n ? "All Good (" + n + " rejected)" : "All Good";
+    btn.classList.toggle("warn", n > 0);
+  }
+
+  async function allGood() {
+    const st = reviewState();
+    if (st.rejected.length) {
+      flash("Not written — " + st.rejected.join(", ") + " still rejected. "
+            + "Send your feedback, or undo the rejection.");
+      return;
+    }
+    // Files opened tab by tab are the only ones whose hunks we know about; anything never
+    // opened has simply not been looked at, and saying so is more honest than assuming.
+    const opened = new Set(openTabs.map((t) => realPath(t.path)));
+    const never = chgItems.map((e) => e.path).filter((p) => !opened.has(p));
+    const un = st.unseen.concat(never.map((p) => p + " (never opened)"));
+    if (un.length && !confirm("Not reviewed yet:\n\n  " + un.join("\n  ")
+                              + "\n\nWrite everything anyway?")) return;
+    await acceptChanges();
+    review.clear();
+  }
+
+  function setupChanges() {
+    $("allGood").onclick = allGood;
+    // While an answer is streaming the agent is writing files, and the point of the list
+    // is to show the state it is in NOW. Both endpoints behind this are cached server-side
+    // (2s for the diff, 5s for the tree), so a poll this slow costs essentially nothing.
+    setInterval(() => { if (busy) refreshChanges(); }, 3000);
+    refreshChanges();
   }
 
   // ---------------- cells ----------------
@@ -2900,14 +3543,15 @@ textarea:focus { outline: none; border-color: var(--accent); }
     // Substitute each directive with the words it shows, remembering where the chip
     // lands in the resulting prose.
     const spans = codeSpans(text);
-    let prose = "", last = 0, idx = 0, m;
+    let prose = "", last = 0, m;
     const marks = [];
     OPEN_RE.lastIndex = 0;
     while ((m = OPEN_RE.exec(text))) {
       if (!isPath(m[1])) continue;
       if (spans.some(([a, b]) => m.index >= a && m.index + m[0].length <= b)) continue;
       prose += text.slice(last, m.index);
-      marks.push({ at: prose.length, idx: idx++ });
+      marks.push({ at: prose.length, path: m[1], spec: m[2] || "",
+                   key: chipKey(m[1], m[2] || "") });
       prose += (m[3] || "").replace(/`/g, "").trim();
       last = m.index + m[0].length;
     }
@@ -2933,11 +3577,9 @@ textarea:focus { outline: none; border-color: var(--accent); }
       SAY_RE.lastIndex = from + said.length;
     }
 
-    const fireFor = (i) => () => {
-      const ds = allDirectives(scope.raw || "");
-      const d = ds[i];
-      if (d) openFile(d.path, d.spec);
-      if (scope.el) markActiveChip(scope.el, i);
+    const fireFor = (k) => () => {
+      openFile(k.path, k.spec);
+      if (scope.el) markActiveChip(scope.el, k.key);
     };
 
     // One chunk per unit, and never more than one: this list has to be a stable PREFIX
@@ -2952,7 +3594,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
       const mine = marks.filter((k) => k.at >= start && k.at < end);
       const say = narrClean(unit);
       if (!say) {
-        for (const k of mine) out.push({ say: "", marks: [{ frac: 0, fire: fireFor(k.idx) }] });
+        for (const k of mine) out.push({ say: "", marks: [{ frac: 0, fire: fireFor(k) }] });
         continue;
       }
       out.push({
@@ -2960,7 +3602,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
         // Where in the audio each chip belongs, as a fraction of the sentence. Piper
         // reports no word timings, so this is proportional to characters -- close
         // enough that the pane moves on the phrase that names it.
-        marks: mine.map((k) => ({ frac: (k.at - start) / unit.length, fire: fireFor(k.idx) })),
+        marks: mine.map((k) => ({ frac: (k.at - start) / unit.length, fire: fireFor(k) })),
       });
     }
     return out;
@@ -3111,15 +3753,18 @@ textarea:focus { outline: none; border-color: var(--accent); }
     if (sent.length) {
       context = "REFERENCES the user attached to this question:\n\n";
       for (const r of sent) {
-        context += "--- " + r.path + " lines " + r.a + "-" + r.b + " ---\n"
-                 + r.text + "\n"
+        const head = r.reject
+          ? "--- " + realPath(r.path) + " near line " + r.a
+            + " \u2014 THE USER REJECTED THIS CHANGE OF YOURS ---"
+          : "--- " + realPath(r.path) + " lines " + r.a + "-" + r.b + srcNote(r.path) + " ---";
+        context += head + "\n" + r.text + "\n"
                  + (r.clipped ? "--- (truncated; read the file for the rest) ---\n" : "")
                  + "\n";
       }
       context = context.trimEnd() + "\n";
     }
     if (t) {
-      context += (context ? "\n" : "") + "[The user is looking at " + t.path;
+      context += (context ? "\n" : "") + "[The user is looking at " + realPath(t.path) + srcNote(t.path);
       if (t.sel) context += ", lines " + t.sel.a + "-" + t.sel.b + " selected";
       context += ".]";
     }
@@ -3176,7 +3821,8 @@ textarea:focus { outline: none; border-color: var(--accent); }
           autoIdx = ds.length - 1;
           openFile(ds[autoIdx].path, ds[autoIdx].spec);
         }
-        markActiveChip(out, autoIdx);
+        const d = ds[autoIdx];
+        markActiveChip(out, d ? chipKey(d.path, d.spec) : null);
       }
     };
 
@@ -3234,7 +3880,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
           if (ds.length) {
             autoIdx = 0;
             openFile(ds[0].path, ds[0].spec);
-            markActiveChip(out, autoIdx);
+            markActiveChip(out, chipKey(ds[0].path, ds[0].spec));
           }
         }
       }
@@ -3250,7 +3896,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
       syncCellNav();
       updateJump();
       show();               // the last part is complete now: release it to the narrator
-      refreshProposals();   // the agent may have drafted a file this turn
+      refreshChanges();   // the agent may have edited the branch this turn
     }
   }
 
@@ -3366,7 +4012,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
     if (!ttsOK && !synth) { narrOn = false; voiceBtn.hidden = true; }
     setVoiceBtn();
     setupModel(d.model, d.models);
-    setupProposals();
+    setupChanges();
     if (d.sync) setupSync();
     renderTree();
     const b = bubble("Claude").querySelector(".body");
@@ -3426,9 +4072,25 @@ def main():
                          "session to pick up. Works with or without --handoff.")
     ap.add_argument("--idle-exit", type=int, default=15, metavar="SECONDS",
                     help="with --handoff, return to the terminal this long after the tab is closed")
-    ap.add_argument("--shadow", default=None, metavar="DIR",
-                    help="where proposed files are drafted before you agree to them "
-                         "(default: ~/.cache/codewalk/shadow/<repo>-<hash>)")
+    ap.add_argument("--base", default=None, metavar="REF",
+                    help="the branch or commit this work grew out of. The Changes pane lists "
+                         "everything different from the merge-base with it, committed or not "
+                         "(default: main, then master, then nothing)")
+    ap.add_argument("--worktree", default=None, metavar="TOPIC",
+                    help="work on a scratch branch in a git worktree instead of in ROOT itself. "
+                         "TOPIC names the branch (codewalk/TOPIC unless it already has a slash); "
+                         "an existing branch is reused. Nothing written there touches ROOT until "
+                         "you merge it")
+    ap.add_argument("--worktree-dir", default=None, metavar="DIR",
+                    help="where to put the worktree "
+                         "(default: ~/.cache/codewalk/trees/<repo>-<hash>/<branch>)")
+    ap.add_argument("--no-carry", action="store_true",
+                    help="start the worktree at the last commit only. By default your "
+                         "uncommitted work is carried over too, so the branch opens in the "
+                         "state your checkout is actually in")
+    ap.add_argument("--carry-max", type=int, default=1 << 20, metavar="BYTES",
+                    help="skip untracked files bigger than this when carrying (default 1 MiB). "
+                         "Tracked edits ride over as a patch and are never subject to it")
     ap.add_argument("--no-open", action="store_true")
     args = ap.parse_args()
     if args.handoff and not args.resume:
@@ -3453,10 +4115,30 @@ def main():
         except OSError as e:
             sys.exit(f"codewalk: could not read --brief-file: {e}")
 
+    # The worktree is made before anything reads the tree: from here down, "the repo" is
+    # the scratch checkout, and the user's own is only ever the thing it forked from.
+    tree, carried = None, None
+    if args.worktree:
+        branch = args.worktree if "/" in args.worktree else "codewalk/" + args.worktree
+        tree = Worktree(args.root, branch, args.worktree_dir)
+        tree.open()
+        Handler.tree = tree
+        # Only into a tree we just made. Replaying the source's working state onto a branch
+        # that already has its own history would overwrite work nobody asked us to touch.
+        if tree.dirty and not tree.attached and not args.no_carry:
+            carried = tree.carry(args.carry_max)
+
     Handler.first_question = args.start
     Handler.sync_path = os.path.abspath(args.sync_file) if args.sync_file else None
-    Handler.repo = Repo(args.root)
-    Handler.shadow = Shadow(args.shadow or default_shadow(Handler.repo.root), Handler.repo)
+    Handler.repo = Repo(tree.path if tree else args.root)
+    Handler.changes = Changes(
+        Handler.repo,
+        args.base or (tree.base_ref if tree else None),
+        # On a fresh branch that commit IS their carried work; on a re-attach it is
+        # whatever codewalk last pinned there, which may have been an Accept.
+        name=("" if (args.base or not tree or not tree.carried)
+              else "last sync" if tree.attached else "your work at launch"),
+    )
     if args.demo is not None:
         script = args.demo or os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                            "demo-walkthrough.md")
@@ -3466,9 +4148,7 @@ def main():
             sys.exit(f"codewalk: could not read --demo script: {e}")
         Handler.models = ["demo"]
     else:
-        Handler.claude = Claude(
-            args.model, Handler.repo.root, parent, brief, shadow=Handler.shadow.root,
-        )
+        Handler.claude = Claude(args.model, Handler.repo.root, parent, brief)
         Handler.models = MODELS + ([args.model] if args.model not in MODELS else [])
     Handler.voice = Voice(*find_piper())
     n = len(Handler.repo.files())
@@ -3477,6 +4157,23 @@ def main():
     url = f"http://127.0.0.1:{args.port}/"
     print(f"codewalk  {Handler.repo.root}  ({n} files{', git' if Handler.repo.is_git else ''})")
     print(f"          {url}   (ctrl-c to stop)")
+    if tree:
+        verb = "on existing branch" if tree.attached else "new branch"
+        print(f"          worktree {verb} {tree.branch}, forked from {tree.source_ref}")
+        if carried:
+            n = carried["patched"] + carried["copied"]
+            print(f"          carried over {n} uncommitted path(s) from {tree.source}, "
+                  f"which stays untouched")
+            for rel, why in carried["skipped"]:
+                print(f"          NOT carried: {rel} — {why}")
+        elif tree.dirty and tree.attached:
+            print(f"          note: {tree.dirty} uncommitted path(s) in {tree.source} are NOT "
+                  f"here — this branch already existed, so its own state was kept")
+        elif tree.dirty:
+            print(f"          note: {tree.dirty} uncommitted path(s) in {tree.source} are NOT "
+                  f"here (--no-carry)")
+        for hint in tree.hints():
+            print(f"          {hint}")
     if parent:
         print(f"          chat forks session {parent} (your original is not modified)")
     if Handler.sync_path:
