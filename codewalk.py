@@ -15,7 +15,7 @@ Claude reads and edits inside ROOT, and steers the center pane with
     [[open:path/to/file.py:120-140|label]]     open that file, highlight and scroll to the range
 
 Under --worktree, ROOT is a scratch checkout on its own branch: Claude changes files there,
-the user reviews the diff hunk by hunk, and All Good writes the result into their real repo
+the user reviews the diff hunk by hunk, and Finalize writes the result into their real repo
 as uncommitted changes.
 
 Standard library only, plus Pygments for highlighting (optional — falls back to plain text).
@@ -482,7 +482,7 @@ class Worktree:
         user should not have to go and look up — and because the wrong one is destructive."""
         return [
             f"open it:  code {self.path}",
-            f"keep it:  press Accept in the page — it writes the agent's paths into "
+            f"keep it:  press Finalize Changes in the page — it writes the agent's paths into "
             f"{self.source} as uncommitted changes, and commits nothing there",
             f"drop it:  git -C {self.source} worktree remove --force {self.path} "
             f"&& git -C {self.source} branch -D {self.branch}",
@@ -1933,7 +1933,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
     <div class="paneHead"><span id="expName">Explorer</span><span class="spacer"></span><span class="dim" id="fileCount" style="text-transform:none;letter-spacing:0"></span></div>
     <input id="filter" type="search" placeholder="Filter files…" aria-label="Filter files">
     <div id="tree"></div>
-    <button id="allGood" hidden>All Good</button>
+    <button id="allGood" hidden>Finalize Changes</button>
   </section>
 
   <div class="sash" id="sash1" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize explorer"></div>
@@ -2777,7 +2777,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
   const CHG = "@changed/";
   let chgItems = [];
   let chgBase = "";
-  let chgSource = "";   // the checkout All Good writes into; empty when there is no worktree
+  let chgSource = "";   // the checkout Finalize writes into; empty when there is no worktree
   let chgAccept = false;
 
   async function refreshChanges() {
@@ -2834,7 +2834,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
     }
   }
 
-  // The one thing in this page that changes something outside the worktree. All Good has
+  // The one thing in this page that changes something outside the worktree. Finalize has
   // already decided whether it should run; this just does it.
   async function acceptChanges() {
     if (!chgItems.length) return;
@@ -2854,7 +2854,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
     }
     const n = res.restored.length + res.deleted.length;
     flash(n + " path(s) written into " + res.source + " as uncommitted changes");
-    btn.textContent = "All Good";
+    btn.textContent = "Finalize Changes";
     for (const t of openTabs.slice()) if (t.path.startsWith(CHG)) closeTab(t.path);
     refreshChanges();
   }
@@ -2881,7 +2881,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
 
   // ---------------- reviewing hunk by hunk ----------------
   // One decision per hunk, held here and nowhere else: nothing is written to the user's
-  // repo until All Good. That is what makes un-accepting free -- it is unmarking, not
+  // repo until Finalize. That is what makes un-accepting free -- it is unmarking, not
   // undoing. The key is the hunk's content hash, so the moment the agent rewrites a hunk
   // its id changes and any mark on the old one falls away instead of quietly transferring
   // to code nobody looked at.
@@ -2978,7 +2978,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
     if (i >= 0) { refs.splice(i, 1); renderRefs(); }
   }
 
-  // All Good is the only thing that writes. It refuses while a rejection is outstanding --
+  // Finalize is the only thing that writes. It refuses while a rejection is outstanding --
   // a rejection is feedback that has not been sent, and shipping the code anyway would make
   // the button a lie -- and it asks first if anything was never looked at.
   function reviewState() {
@@ -3000,7 +3000,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
     if (!btn) return;
     btn.hidden = !chgItems.length || !chgAccept;
     const n = refs.filter((r) => r.reject).length;
-    btn.textContent = n ? "All Good (" + n + " rejected)" : "All Good";
+    btn.textContent = n ? "Finalize (" + n + " rejected)" : "Finalize Changes";
     btn.classList.toggle("warn", n > 0);
   }
 
