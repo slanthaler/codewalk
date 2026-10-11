@@ -1,26 +1,40 @@
 #!/usr/bin/env python3
 """
-codewalk — a local three-pane workspace for talking about code: tree | file | chat.
+codewalk — a dashboard that agents submit code reviews to.
 
-    python codewalk.py [ROOT] [--port 8765] [--model opus] [--no-open]
-    python codewalk.py [ROOT] --worktree <topic>      # work on a scratch branch instead
+    codewalk.py serve                                  # leave this open
+    codewalk.py submit --title "..." --notes notes.md  # what an agent runs
+    codewalk.py wait <id>                              # re-attach to one
 
-Left:   the repo file tree (from `git ls-files` when ROOT is a git repo), with a filter box,
-        and below it the Changes list — every file that differs from the base commit.
-Center: the open file, syntax-highlighted (Pygments, server-side), with line numbers and tabs.
-Right:  a chat that shells out to the `claude` CLI, streaming the answer back.
+One dashboard, many agents. An agent changes files, writes a notes file saying what to look
+at and in what order, and submits it with a title. The dashboard lists what is pending; you
+open one and get three panes:
 
-Claude reads and edits inside ROOT, and steers the center pane with
+    left     that repository's file tree, changed files badged
+    center   the open file, syntax-highlighted, with the diff spliced in place, the agent's
+             notes and your comments pinned to the lines they are about
+    right    the review: every change in reading order, your verdicts, and Send
 
-    [[open:path/to/file.py:120-140|label]]     open that file, highlight and scroll to the range
+`submit` BLOCKS until you press Send, then prints your verdicts and comments to stdout — so
+the agent runs one command and reads the result as that command's output. Each review
+carries its own repository root and base commit, so several agents in several checkouts can
+be waiting at once. The dashboard never writes to any repository: a verdict is a statement
+back to the agent, never an edit.
 
-Under --worktree, ROOT is a scratch checkout on its own branch: Claude changes files there,
-the user reviews the diff hunk by hunk, and Finalize writes the result into their real repo
-as uncommitted changes.
+The notes file is markdown. Everything before the first heading is the brief; each
+`## <path>[:<line>[-<line>]] <title>` heading is one stop, and the file's order is the
+reading order:
+
+    New attention block, wired in behind a config flag. Read the stops in order.
+
+    ## model/config.py:40-52  Settings for the new block
+    Added `attn: AttnCfg`. Defaults keep the old behaviour.
+
+    ## model/build.py:88-94  Where it gets built
+    One branch in `build_model`. Nothing else in the wiring changed.
 
 Standard library only, plus Pygments for highlighting (optional — falls back to plain text).
 """
-
 from __future__ import annotations
 
 import argparse
@@ -28,15 +42,14 @@ import difflib
 import hashlib
 import json
 import os
-import glob
-import queue
 import re
-import shutil
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -49,6 +62,7 @@ except ImportError:
 
 MAX_FILES = 20000
 MAX_BYTES = 4_000_000
+IDLE_EXIT = 15          # seconds after the tab stops pinging before we give up on it
 SKIP_DIRS = {
     ".git", ".hg", ".svn", "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache",
     ".ruff_cache", ".ipynb_checkpoints", ".venv", "venv", "env", "dist", "build",
@@ -157,352 +171,27 @@ class Repo:
             "path": rel,
             "name": os.path.basename(rel),
             "digest": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
-            "mtime": os.path.getmtime(full),
             "lines": tokenize(text, full),
         }
 
-    def mtime(self, rel: str) -> float:
-        full = self.resolve(rel)
-        try:
-            return os.path.getmtime(full) if full else 0.0
-        except OSError:
-            return 0.0
 
-    def apply(self, rel: str, start: int, end: int, replacement: str, digest: str) -> dict:
-        full = self.resolve(rel.lstrip("/"))
-        if full is None or not os.path.isfile(full):
-            return {"ok": False, "error": f"No such file: {rel}"}
-        with open(full, encoding="utf-8") as fh:
-            text = fh.read()
-        if hashlib.sha256(text.encode("utf-8")).hexdigest()[:16] != digest:
-            return {"ok": False, "error": "The file changed since that suggestion. Reload and ask again."}
-        old = text.split("\n")
-        shown = len(old) - 1 if old and old[-1] == "" else len(old)
-        if not (1 <= start <= end <= shown):
-            return {"ok": False, "error": f"Lines {start}-{end} are outside this {shown}-line file."}
-        body = "\n".join(old[: start - 1] + replacement.split("\n") + old[end:])
-        try:
-            # No .bak copy. The previous content is in the branch this worktree is on, which
-            # is the whole reason for working on a branch — and a stray backup file would
-            # show up in the Changes list as new work and get carried into the user's repo
-            # on Accept, which is exactly the pollution this design exists to prevent.
-            with open(full, "w", encoding="utf-8") as fh:
-                fh.write(body)
-        except OSError as e:
-            return {"ok": False, "error": f"Could not write the file: {e}"}
-        return {
-            "ok": True,
-            "digest": hashlib.sha256(body.encode("utf-8")).hexdigest()[:16],
-            "added": len(replacement.split("\n")),
-        }
-
-
-def cache_root() -> str:
-    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
-    return os.path.join(base, "codewalk")
-
-
-def default_trees(root: str) -> str:
-    """Outside the repo on purpose: a worktree nested inside its own source is a mess git
-    tolerates and no tool expects."""
-    tag = hashlib.sha256(os.path.abspath(root).encode("utf-8")).hexdigest()[:8]
-    return os.path.join(cache_root(), "trees", f"{os.path.basename(root.rstrip(os.sep))}-{tag}")
-
-
-class Worktree:
-    """A scratch checkout of the repo, on its own branch, where the agent does its work.
-
-    This is the whole safety model, and it is git's, not ours: the agent writes real files
-    into a real tree that tests can run against, and none of it is in the checkout the user
-    is editing. Nothing has to arbitrate which copy is authoritative — the branch is.
-    """
-
-    def __init__(self, source: str, branch: str, path: str | None):
-        self.source = os.path.abspath(source)
-        self.branch = branch
-        self.path = os.path.abspath(path) if path else os.path.join(
-            default_trees(self.source), branch.replace("/", "-"))
-        self.source_ref = ""   # what it grew out of; the base every diff is taken against
-        self.attached = False  # it already existed and we joined it
-        self.dirty = 0         # uncommitted paths in the SOURCE, before anything is carried
-        self.carried = ""      # commit holding that work, once it is in this tree
-
-    def _git(self, *args: str, cwd: str | None = None) -> tuple[int, str, str]:
-        try:
-            out = subprocess.run(
-                ["git", *args], cwd=cwd or self.source,
-                capture_output=True, text=True, errors="replace", timeout=30,
-            )
-        except (OSError, subprocess.SubprocessError) as e:
-            return 1, "", str(e)
-        return out.returncode, out.stdout.strip(), out.stderr.strip()
-
-    def _existing(self) -> str | None:
-        """The path of a worktree already checked out on this branch, if there is one."""
-        code, out, _ = self._git("worktree", "list", "--porcelain")
-        if code != 0:
-            return None
-        path = None
-        for line in out.split("\n"):
-            if line.startswith("worktree "):
-                path = line[9:]
-            elif line == "branch refs/heads/" + self.branch and path:
-                return path
-        return None
-
-    def open(self) -> None:
-        """Create the worktree, or attach to the one that is already on this branch."""
-        if not os.path.exists(os.path.join(self.source, ".git")):
-            sys.exit(f"codewalk: --worktree needs a git repository; {self.source} is not one")
-        code, head, _ = self._git("rev-parse", "HEAD")
-        if code != 0:
-            sys.exit(f"codewalk: --worktree needs a repository with at least one commit")
-
-        # Captured before anything moves. merge-base against this name is the fork point
-        # for the whole life of the branch, however far the source advances afterwards.
-        code, name, _ = self._git("symbolic-ref", "--quiet", "--short", "HEAD")
-        self.source_ref = name if code == 0 and name else head
-
-        code, out, _ = self._git("status", "--porcelain")
-        self.dirty = len([l for l in out.split("\n") if l.strip()]) if code == 0 else 0
-
-        here = self._existing()
-        # git itself would refuse to add a second worktree for a branch that is already
-        # checked out — but if it is checked out HERE, "reuse it" would mean handing the
-        # agent the user's own working tree while telling them it was isolated.
-        if here and os.path.realpath(here) == os.path.realpath(self.source):
-            sys.exit(f"codewalk: {self.branch} is the branch checked out in {self.source} "
-                     f"itself, so its worktree is that same tree — nothing would be isolated. "
-                     f"Switch that checkout to another branch, or pick another --worktree topic.")
-        if here:
-            self.path, self.attached = here, True
-            # Re-joining a branch that already has history: measure from the last thing
-            # codewalk itself pinned there — the carry at its creation, or the most recent
-            # Accept. Falling back to the fork point would show every previously carried or
-            # accepted file as fresh work of the agent's, which is the one thing the list
-            # must not do.
-            code, sha, _ = self._git("log", "-1", "--format=%H", "--grep", "^codewalk:",
-                                     self.branch)
-            if code == 0 and sha:
-                self.carried = sha
-            return
-
-        if os.path.exists(self.path) and os.listdir(self.path):
-            sys.exit(f"codewalk: {self.path} already exists and is not a worktree for "
-                     f"{self.branch}. Pass --worktree-dir, or remove it.")
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
-
-        code, _, _ = self._git("rev-parse", "--verify", "--quiet", "refs/heads/" + self.branch)
-        if code == 0:      # the branch is there, just not checked out anywhere
-            args = ["worktree", "add", self.path, self.branch]
-        else:
-            args = ["worktree", "add", "-b", self.branch, self.path, self.source_ref]
-        code, _, err = self._git(*args)
-        if code != 0:
-            sys.exit(f"codewalk: could not create the worktree:\n{err}")
-
-    def _git_bytes(self, *args: str) -> bytes | None:
-        try:
-            out = subprocess.run(["git", *args], cwd=self.source,
-                                 capture_output=True, timeout=60)
-        except (OSError, subprocess.SubprocessError):
-            return None
-        return out.stdout if out.returncode == 0 else None
-
-    def carry(self, max_bytes: int) -> dict:
-        """Reproduce the source's uncommitted state inside the fresh worktree.
-
-        Half-finished work is the normal reason to hand a file to an agent, and asking the
-        user to commit it first is asking them to lie in their history. So the branch starts
-        at the last commit and then this puts their working state back on top of it.
-
-        Tracked changes ride over as a patch — the hunks, not the files, so the size of the
-        file they are in does not matter. Untracked files are real copies, which is the only
-        place a size cap earns its keep; `--exclude-standard` has already dropped everything
-        .gitignore covers, so what is left is small by construction unless something is wrong.
-        """
-        report = {"patched": 0, "copied": 0, "skipped": []}
-
-        patch = self._git_bytes("diff", "HEAD", "--binary")
-        if patch:
-            if len(patch) > max_bytes * 8:
-                report["skipped"].append(
-                    (f"{len(patch) // 1024} KB of tracked changes", "patch too large"))
-            else:
-                try:
-                    out = subprocess.run(
-                        ["git", "apply", "--whitespace=nowarn", "-"],
-                        cwd=self.path, input=patch, capture_output=True, timeout=60,
-                    )
-                except (OSError, subprocess.SubprocessError) as e:
-                    out = None
-                    report["skipped"].append(("tracked changes", str(e)))
-                if out is not None:
-                    if out.returncode == 0:
-                        report["patched"] = sum(
-                            1 for l in patch.split(b"\n") if l.startswith(b"--- a/"))
-                    else:
-                        report["skipped"].append(
-                            ("tracked changes",
-                             out.stderr.decode("utf-8", "replace").strip().split("\n")[0]))
-
-        raw = self._git("ls-files", "--others", "--exclude-standard", "-z")[1]
-        for rel in raw.split("\0"):
-            if not rel:
-                continue
-            # The same filter the file tree uses. `--exclude-standard` only knows what
-            # .gitignore knows, and a repo without one carries its __pycache__ straight in.
-            if os.path.splitext(rel)[1].lower() in SKIP_EXT:
-                continue
-            if any(part in SKIP_DIRS for part in rel.split("/")):
-                continue
-            src = os.path.join(self.source, rel)
-            if os.path.islink(src) or not os.path.isfile(src):
-                continue
-            try:
-                size = os.path.getsize(src)
-            except OSError:
-                continue
-            if size > max_bytes:
-                report["skipped"].append((rel, f"{size // 1024} KB, over the carry limit"))
-                continue
-            dest = os.path.join(self.path, rel)
-            try:
-                os.makedirs(os.path.dirname(dest), exist_ok=True)
-                shutil.copy2(src, dest)
-                report["copied"] += 1
-            except OSError as e:
-                report["skipped"].append((rel, str(e)))
-
-        if report["patched"] or report["copied"]:
-            self._commit_carried()
-        return report
-
-    def _commit_carried(self) -> None:
-        """Pin the carried work as a commit, and diff against THAT.
-
-        Without this the user's own half-finished edits are the first thing in their
-        Changes list, attributed to an agent that has not done anything yet — which is the
-        one thing that list must never get wrong. Committing it here also makes the branch
-        honest: it holds their work, then the agent's, in that order.
-        """
-        msg = f"codewalk: uncommitted work carried from {self.source}"
-        code, _, _ = self._git("add", "-A", cwd=self.path)
-        if code != 0:
-            return
-        code, _, _ = self._git("commit", "-q", "-m", msg, cwd=self.path)
-        if code != 0:   # no committer identity configured anywhere
-            code, _, _ = self._git(
-                "-c", "user.name=codewalk", "-c", "user.email=codewalk@localhost",
-                "commit", "-q", "-m", msg, cwd=self.path)
-        if code == 0:
-            self.carried = self._git("rev-parse", "HEAD", cwd=self.path)[1]
-
-    @property
-    def base_ref(self) -> str:
-        """What the Changes list measures against: the carried state if there is one, so the
-        list starts empty and holds only what the agent did."""
-        return self.carried or self.source_ref
-
-    def _blob(self, ref: str, rel: str) -> bytes | None:
-        """The bytes of one path at one commit, or None if it was not there."""
-        try:
-            out = subprocess.run(["git", "show", f"{ref}:{rel}"], cwd=self.path,
-                                 capture_output=True, timeout=30)
-        except (OSError, subprocess.SubprocessError):
-            return None
-        return out.stdout if out.returncode == 0 else None
-
-    def _here(self, rel: str) -> bytes | None:
-        full = os.path.join(self.source, rel)
-        if not os.path.isfile(full) or os.path.islink(full):
-            return None
-        try:
-            with open(full, "rb") as fh:
-                return fh.read()
-        except OSError:
-            return None
-
-    def accept(self, entries: list[dict], baseline: str) -> dict:
-        """Commit what the agent did, then put exactly those paths into the user's checkout.
-
-        Content, not commits: the branch keeps the history, the user's repo gets working-tree
-        changes they can still read with `git diff` and take apart with `git add -p`. Nothing
-        is committed on their side, which is the whole point — they never asked for their
-        half-finished work to enter history, and this does not put it there.
-        """
-        if not entries:
-            return {"ok": False, "error": "There is nothing to accept."}
-
-        # What their checkout held at the point this diff is measured from — the carried
-        # commit at first, then whatever the last accept wrote. Anything not still matching
-        # means they edited it themselves since, and writing over that would destroy work
-        # nobody reviewed. It has to be the MOVING baseline: compare against the original
-        # fork forever and the second accept blocks every path the first one wrote.
-        blocked = [e["path"] for e in entries
-                   if self._here(e["path"]) != self._blob(baseline, e["path"])]
-        if blocked:
-            return {"ok": False, "blocked": blocked,
-                    "error": "— you edited those yourself since the last sync, so nothing "
-                             "was written. Reconcile them by hand, or discuss them here first."}
-
-        code, _, err = self._git("add", "-A", cwd=self.path)
-        if code != 0:
-            return {"ok": False, "error": f"Could not stage the branch: {err}"}
-        msg = "codewalk: " + ", ".join(e["path"] for e in entries[:4]) + \
-              (f" and {len(entries) - 4} more" if len(entries) > 4 else "")
-        code, _, err = self._git("commit", "-q", "-m", msg, cwd=self.path)
-        if code != 0:
-            code, _, err = self._git("-c", "user.name=codewalk",
-                                     "-c", "user.email=codewalk@localhost",
-                                     "commit", "-q", "-m", msg, cwd=self.path)
-        # An empty commit means the agent's work was already committed on the branch; that is
-        # fine and the restore below still has something to read.
-        sha = self._git("rev-parse", "HEAD", cwd=self.path)[1]
-
-        live = [e["path"] for e in entries if e["state"] != "deleted"]
-        gone = [e["path"] for e in entries if e["state"] == "deleted"]
-        if live:
-            code, _, err = self._git("restore", "--source", sha, "--", *live)
-            if code != 0:
-                return {"ok": False, "error": f"Could not write into {self.source}: {err}",
-                        "commit": sha}
-        removed = []
-        for rel in gone:
-            try:
-                os.remove(os.path.join(self.source, rel))
-                removed.append(rel)
-            except OSError:
-                pass
-        return {"ok": True, "commit": sha, "restored": live, "deleted": removed,
-                "source": self.source}
-
-    def hints(self) -> list[str]:
-        """What to do with it afterwards. Printed, because the answer is git commands the
-        user should not have to go and look up — and because the wrong one is destructive."""
-        return [
-            f"open it:  code {self.path}",
-            f"keep it:  press Finalize Changes in the page — it writes the agent's paths into "
-            f"{self.source} as uncommitted changes, and commits nothing there",
-            f"drop it:  git -C {self.source} worktree remove --force {self.path} "
-            f"&& git -C {self.source} branch -D {self.branch}",
-        ]
-
+# ----------------------------------------------------------------------------------
+# what changed
+# ----------------------------------------------------------------------------------
 
 class Changes:
-    """What the agent has proposed, read as a git diff against a base commit.
+    """What the agent has done, read as a git diff against a base commit.
 
     This answers the question a reviewer actually asks — what is different from where we
     started — and it answers it from git rather than from a second copy of the tree. It
-    reads the WORKING tree, and counts untracked files too, so a change shows up whether the
-    agent committed it, staged it, or just wrote the file, and the reviewer never has to know
-    which of those happened.
+    reads the WORKING tree, and counts untracked files too, so a change shows up whether
+    the agent committed it, staged it, or just wrote the file, and the reviewer never has
+    to know which of those happened.
     """
 
-    def __init__(self, repo: "Repo", ref: str | None, name: str = ""):
+    def __init__(self, repo: "Repo", ref: str | None):
         self.repo = repo
         self.ref = ref
-        self.name = name   # what to call the base in the UI, when a sha would say nothing
         self._lock = threading.Lock()
         self._base: str | None = None
         self._entries: list[dict] = []
@@ -520,20 +209,19 @@ class Changes:
         return out.stdout if out.returncode == 0 else None
 
     def base(self) -> str | None:
-        """The commit the branch grew out of. Resolved once — it does not move while a
-        review is happening, and re-resolving it mid-review would silently reframe the diff."""
+        """What the diff is measured from. Resolved once — it must not move while a review
+        is happening, since that would silently reframe everything on screen."""
         if self._base is not None:
             return self._base or None
         if not self.repo.is_git:
             self._base = ""
             return None
-        names = [self.ref] if self.ref else ["main", "master"]
-        for name in names:
+        for name in ([self.ref] if self.ref else ["HEAD"]):
             if not name:
                 continue
-            merged = self._git("merge-base", name, "HEAD")
-            sha = (merged or "").strip()
-            if not sha:  # not a branch we can fork from; maybe it is a raw commit
+            # A branch name means the point we forked from it, not its tip.
+            sha = (self._git("merge-base", name, "HEAD") or "").strip()
+            if not sha:
                 sha = (self._git("rev-parse", "--verify", name + "^{commit}") or "").strip()
             if sha:
                 self._base = sha
@@ -546,22 +234,15 @@ class Changes:
         sha = self.base()
         if not sha:
             return ""
-        name = self.name or self.ref or "main/master"
-        if not self.name and sha.startswith(name):  # the ref *is* the commit; say it once
+        name = self.ref or "HEAD"
+        if sha.startswith(name):     # the ref *is* the commit; say it once
             return sha[:8]
         return f"{name} @ {sha[:8]}"
 
     # -- the list --------------------------------------------------------------
-    def rebase(self, sha: str, name: str = "") -> None:
-        """Measure from here on. Called after an accept, so the list empties and then holds
-        only what the agent does next."""
-        with self._lock:
-            self.ref, self.name, self._base = sha, name, None
-            self._entries, self._at = [], 0.0
-
     def entries(self) -> list[dict]:
         with self._lock:
-            if time.time() - self._at < 2:
+            if self._entries and time.time() - self._at < 2:
                 return self._entries
             self._entries = self._scan()
             self._at = time.time()
@@ -597,9 +278,11 @@ class Changes:
         # this the one change you most need to see is the one that does not show up.
         raw = self._git("ls-files", "--others", "--exclude-standard", "-z") or ""
         for path in raw.split("\0"):
-            if path and path not in status:
-                status[path] = "A"
-                counts[path] = (len(self.new_text(path).splitlines()), 0)
+            if not path or path in status:
+                continue
+            text = self.new_text(path)
+            status[path] = "A"
+            counts[path] = (len(text.splitlines()), 0)
 
         out = []
         for path, letter in sorted(status.items()):
@@ -615,6 +298,9 @@ class Changes:
                 "binary": add < 0,
             })
         return out
+
+    def has(self, rel: str) -> bool:
+        return any(e["path"] == rel for e in self.entries())
 
     # -- one file --------------------------------------------------------------
     def old_text(self, rel: str) -> str:
@@ -652,33 +338,17 @@ class Changes:
             return {"error": f"{rel} is too large to display."}
 
         # A deletion is the whole file going, so splice it against nothing and every line
-        # reads as removed -- the same view, not a special case.
+        # reads as removed — the same view, not a special case.
         view = splice(rel, old, "" if deleted else new)
         return {
             "path": rel,
             "name": os.path.basename(rel),
             "digest": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
-            "mtime": self.repo.mtime(rel),
             "state": entry["state"],
             "deleted": deleted,
             "base": self.label(),
             **view,
         }
-
-    def diff_text(self, rel: str) -> list[dict]:
-        """Unified diff as rows the chat and the pane render without a diff library."""
-        old, new = self.old_text(rel), self.new_text(rel)
-        rows = []
-        for line in difflib.unified_diff(
-            old.splitlines(), new.splitlines(), fromfile=rel, tofile=rel, lineterm="",
-        ):
-            if line.startswith("+++") or line.startswith("---"):
-                continue
-            kind = "hunk" if line.startswith("@@") else (
-                "plus" if line.startswith("+") else "minus" if line.startswith("-") else "same"
-            )
-            rows.append({"k": kind, "t": line})
-        return rows
 
 
 def tokenize(text: str, path: str) -> list[list[dict]]:
@@ -712,19 +382,20 @@ def tokenize(text: str, path: str) -> list[list[dict]]:
 
 
 def splice(path: str, old_text: str, new_text: str) -> dict:
-    """Two versions of a file as ONE readable column: context, then what would go, then
-    what would arrive, in place.
+    """Two versions of a file as ONE readable column: context, then what went, then what
+    arrived, in place.
 
-    The gutter numbers the file as it would be AFTER the change, and a removed line shows
-    a dash instead of a number -- one coherent run of numbers top to bottom, which is what
-    you want when the question is "what will this file look like".
-
-    Each run of difference is a hunk with an id taken from its own content, so the id
-    survives a re-render and changes the moment the hunk does. A review mark keyed by it is
-    therefore never silently carried over onto something the agent has since rewritten.
+    The gutter numbers the file as it is AFTER the change, and a removed line shows a dash
+    instead of a number — one coherent run of numbers top to bottom, which is what you want
+    when the question is "what does this file look like now". It also means a line number
+    in a comment is a line number in the file, with no translation anywhere.
     """
-    old = old_text.split("\n")
-    new = new_text.split("\n")
+    # Empty text is NOT one empty line. `"".split()` gives [""], a phantom line that difflib
+    # happily matches against a real blank line in the other version — so a brand new file
+    # came out as two hunks with a fabricated line of context between them, and had to be
+    # approved twice. A side that does not exist has no lines at all.
+    old = old_text.split("\n") if old_text else []
+    new = new_text.split("\n") if new_text else []
     old_tok, new_tok = tokenize(old_text, path), tokenize(new_text, path)
     # tokenize() drops a trailing empty line; keep the two views the same length.
     old_tok += [[] for _ in range(len(old) - len(old_tok))]
@@ -756,9 +427,7 @@ def splice(path: str, old_text: str, new_text: str) -> dict:
         for j in range(j1, j2):
             n += 1
             lines.append(new_tok[j]); nums.append(str(n)); marks.append("add")
-        body = "\n".join(old[i1:i2]) + "\x00" + "\n".join(new[j1:j2])
         hunks.append({
-            "id": hashlib.sha256((path + "\x00" + body).encode("utf-8")).hexdigest()[:12],
             "at": at, "rows": len(lines) - at,
             "removed": i2 - i1, "added": j2 - j1,
             "line": n - (j2 - j1) + 1 if j2 > j1 else n + 1,
@@ -775,577 +444,363 @@ def css_class(ttype) -> str:
     return ""
 
 
-# ----------------------------------------------------------------------------------
-# talking to claude
-# ----------------------------------------------------------------------------------
-
-RULES = """\
-You are Claude, working with someone on the codebase rooted at {root}. You are inside codewalk: a \
-local three-pane dashboard they are looking at RIGHT NOW.
-
-    left     the file tree
-    center   the file you last opened, scrolled to the lines you last highlighted
-    right    this conversation
-
-The center pane is yours and it persists — whatever you opened last is still on their screen, so \
-you can talk about it as something they can see. Never ask them to paste code, to open a file \
-themselves, or to scroll somewhere; open it for them.
-{inherited}
-Use your Read, Grep and Glob tools freely to pull up whatever you need, and never cite a line you \
-have not read — a wrong line number costs you their trust faster than a vague answer does. You \
-cannot run commands; you can write files, under the rules in directive 5.
-
-Each reply becomes a titled CELL in the right-hand pane, pinned so its first line sits at the top \
-of their view while the rest fills in underneath. They start reading the moment your first words \
-land, so those words must carry the point: no preamble, no restating the question, no throat \
-clearing. They can also jump back through earlier cells by title, which is what the titles are for.
-
-Answer what they actually asked, at the length that answer takes. This is an ordinary working \
-conversation about code — a question, a debugging session, a design argument, a review, a change \
-they want made — and the pane is what makes it better than a terminal, not a format to fill.
-
-What the dashboard does change is that showing beats telling. Whatever they ask, put the relevant \
-code in front of them: find it, open it at the exact lines with [[open:...]], and say what matters \
-about it. "Which transformer architecture is this" is answered by opening the class and the two \
-lines that give it away, not by describing them from memory. A short answer anchored on real lines \
-is worth more than a long one that is not.
-
-This holds when the code does not exist yet. If you are thinking through a new implementation with \
-them, keep opening the code it would touch, sit next to, or replace — a design conversation \
-grounded in the actual call sites stays honest in a way an abstract one does not.
-
-Answer in plain prose. No headings, no bullet lists. A few short paragraphs at \
-most unless they ask for depth. They are a strong engineer, so be concrete and skip the basics. \
-Say why the code is the way it is — the shape of the trade-off, what would break if it were \
-written the obvious way — rather than narrating what the lines they can already see literally do.
-
-You drive their center pane with six directives, and you should use them constantly:
-
-1. To point at code, write [[open:PATH:START-END|short label]] inline, exactly where you would \
-otherwise have written "see model.py lines 120-140". PATH is relative to the project root. The pane \
-opens that file, highlights the range and scrolls to it. A whole file is [[open:PATH|label]]. \
-Several ranges in one file: [[open:PATH:10-20,44|label]]. Line numbers must be the real ones from \
-the file you read.
-
-Be sparing. Each one MOVES their screen, and a reader who is looking at the code cannot follow a \
-pane that jumps every sentence — they end up reading none of it. One or two per part, on the lines \
-that carry the point, and stay in that file while you talk about it. Naming a file or a function \
-in prose is often enough; open it only when they need to see the lines to follow you.
-
-2. To propose a change, MAKE it. Edit the file in {root} with your tools. You are in a \
-throwaway worktree on a scratch branch, so writing a change is how a change gets proposed: \
-nothing you touch is the user's own code, and nothing reaches it until they say so.
-
-They read your work as a diff. Every run of change in a file gets its own bar in the centre \
-pane with accept and reject on it, so the unit they are deciding on is the hunk, not the \
-file and not the whole turn. Two consequences for how you work:
-
-Keep each change small and about one thing. Two unrelated fixes in adjacent lines become ONE \
-hunk they cannot take apart, and they will have to reject both to object to either.
-
-When they reject one, it arrives as a REFERENCES block marked "THE USER REJECTED THIS CHANGE \
-OF YOURS", holding the exact lines that would have gone and the exact lines you wanted to put \
-there. Their note beside it may be two words.
-
-If you can tell what they want, go and do it: revise that hunk in the file and say in a \
-sentence what changed. Revise narrowly -- anything they already accepted keeps its decision \
-for as long as you do not touch it.
-
-If you CANNOT tell, ask. "Too verbose" might mean the comment, the name, or the whole \
-abstraction, and guessing produces a revision that looks like you understood when you did \
-not. Say which readings you can see and ask which one they meant, and leave the file alone \
-until they say. A question is a complete answer to a rejection; a confident wrong rewrite is \
-not, because they now have to review it before they can tell you it missed.
-
-Either way the hunk stays rejected until you actually change it, and they cannot finish while \
-anything is rejected -- so if you are asking, ask ONE specific question and nothing else. Do \
-not offer a menu, and do not re-explain or argue for the version they just turned down.
-
-Never write [[edit:...]]. It is not applied, and a change the user cannot accept or reject is \
-not a proposal.
-
-3. Write the WHOLE answer in one reply, at the length the answer actually takes. When that is \
-long enough to need pacing, cut it into parts with
-
-[[continue: what the next part covers]]
-
-between them. The reader sees the first part and a Continue button; each press reveals the next \
-part of what you already wrote. Nothing is re-run and nothing is generated on the press, so this \
-costs you nothing — it is purely how fast the text arrives in front of them.
-
-A part is ONE coherent idea, two or three short paragraphs, with one or two [[open:...]] \
-directives on the lines that part is about. Cut where the subject changes, never mid-argument, and \
-make the label say what comes next so the button is a real choice. Nothing follows the last part: \
-no trailing directive, no summary of what you just said.
-
-Short answers have no parts at all. A question with an answer gets the answer.
-
-4. Begin EVERY reply — without exception, including short answers to questions — with
-
-[[title: three to six words]]
-
-on its own first line, naming what that reply is about. It is stripped from the prose and used as \
-the heading on that cell, so they can scan back through the conversation and find it again. \
-Name the specific subject, not the genre: "RevIN running statistics" or "why the mask is \
-concatenated", never "Explanation" or "Next step". Do not repeat the title in the body text.
-
-5. {root} is a git worktree on a scratch branch, not the user's own checkout. Write into it \
-freely — new files, rewrites, whole alternative versions. Nothing you do here touches the tree \
-they are working in, and none of it is permanent until they merge the branch, so draft the thing \
-rather than describing it.
-
-Everything you change shows up in their Changes list, against {base}, committed or not. That list \
-is how they review you, so keep it honest: no scratch files, no half-finished edits left behind \
-because you changed your mind, no reformatting a file you were not asked to touch. Every entry in \
-it should be something you would defend. And say in the chat what you wrote and why — a file \
-appearing in that list with no explanation is not a discussion.
-
-6. To show code that is NOT in the repo — a proposed new function, a sketch, a snippet from \
-elsewhere — use a fenced ``` block. That is the one place fences belong. Code that IS in the repo \
-must be shown with [[open:...]] instead, so they see it in context in the center pane with the \
-real line numbers around it.
-
-The user can attach code to a question. When they do, the exact text arrives above their message \
-under a REFERENCES heading, with the path and line numbers. That attached code is what they are \
-asking about — answer about it directly, and do not re-read those lines unless you need surrounding \
-context.
-
-The explorer also lists every file that differs from {base} — the work on this branch, committed or \
-not — and the user reviews it by clicking through that list. A reference marked "(your version on \
-this branch)" is code YOU wrote, quoted back at you from that review. Read it as a change request \
-about those exact lines, and expect it to be terse: "too verbose", "wrong order", "why". The path, \
-the range and the text are already in front of you, so do not ask which part they mean — they \
-attached it precisely so they would not have to say. When a change is what they are asking for, \
-make it in the file -- that is what puts it in front of them. You can open the diff view yourself \
-with [[open:@changed/PATH:START-END]].
-{brief}"""
-
-
-VOICE_NOTE = """
-THE USER IS LISTENING TO THIS ANSWER. Every word you write is spoken aloud by a synthetic voice
-while they watch the code pane. You are not writing text that happens to be read out — you are
-TALKING to someone who cannot see your sentence and cannot go back over it.
-
-This changes how you write, not just which words you pick. Say a thing the way you would say it to
-a colleague sitting next to you, out loud, with no whiteboard.
-
-Never write a shape, signature or expression in symbols. Say what it IS:
-
-  BAD:  inputs arrive as batch by variates by num_patches by patch_length (bvnp)
-  GOOD: inputs arrive as a four dimensional tensor: batch, variate, patch number, and patch length
-
-  BAD:  it reshapes (b v n d) to (b*n, v, d) and applies attention over v
-  GOOD: it folds the patch axis into the batch axis, so attention runs across variates
-
-  BAD:  a single full attention over (bv, n+v, d) would be quadratic
-  GOOD: attending over sequence and variates at once would cost the square of both together
-
-The precision belongs on the screen, not in the ear: point at the line with [[open:...]] and say in
-words what it does. They can read the exact shape there while you talk.
-
-Also: short sentences, subject first, no parentheses mid-sentence — a spoken aside has no brackets,
-so make it its own sentence. No lists of symbols. No abbreviations they would have to unpack, like
-"bvnp" or "MHA"; say the words.
-
-When a sentence really must be written with symbols for the screen, put the spoken version after it
-in a [[say: ...]] directive, and that is what will be read aloud in place of that sentence:
-
-  The mixing transformer runs `(b*n, v, d)` attention separately. [[say: the mixing transformer
-  runs attention across variates separately, with the patch axis folded into the batch.]]
-
-Use [[say: ...]] sparingly — reformulating the sentence itself is almost always better.
-"""
-
-
-INHERITED_NOTE = """
-This conversation is a fork of the terminal session where the user and you designed and built this
-code together, so that history is already above — the decisions, the reasoning, the things you tried
-and rejected. Draw on it. Do not re-derive choices that were already made there, and do not
-reintroduce yourself as if you were meeting this code for the first time.
-"""
-
-
-def find_session(spec: str, context_dir: str) -> str | None:
-    """Resolve a session id, or 'latest' -> the newest Claude Code session for context_dir."""
-    if spec and spec != "latest":
-        return spec
-    proj = re.sub(r"[^A-Za-z0-9]", "-", os.path.abspath(context_dir))
-    found = glob.glob(os.path.join(os.path.expanduser("~/.claude/projects"), proj, "*.jsonl"))
-    if not found:
-        return None
-    newest = max(found, key=os.path.getmtime)
-    return os.path.splitext(os.path.basename(newest))[0]
-
-
-# Aliases `claude --model` accepts. The page offers these; --model can name anything
-# else and it is added to the list so the session's own choice stays selectable.
-MODELS = ["opus", "sonnet", "haiku"]
-
-
-class Script:
-    """A canned stand-in for Claude, so the page can be worked on without a model call.
-
-    Duck-types the parts of Claude the handler touches. Answers come from a file of
-    turns separated by "=== " lines and are served in order, the last one repeating;
-    they stream out word by word because anything that looks at partial text -- the
-    narration, the pane following, the live diff cards -- only misbehaves mid-stream.
-    """
-
-    def __init__(self, path: str, model: str = "demo"):
-        self.model = model
-        self.brief = ""
-        self.pending = None
-        self.i = 0
-        self.lock = threading.Lock()
-        with open(path, encoding="utf-8") as fh:
-            body = fh.read()
-        body = re.sub(r"\A(?:#[^\n]*\n|\s*\n)+", "", body)     # strip the file header
-        turns = [t.strip() for t in re.split(r"^===[^\n]*\n", body, flags=re.M)]
-        self.turns = [t for t in turns if t] or ["Nothing in the demo script."]
-
-    @property
-    def inherited(self) -> str:
-        return ""
-
-    def ask(self, prompt: str, system: str, emit):
-        with self.lock:
-            text = self.turns[min(self.i, len(self.turns) - 1)]
-            self.i += 1
-        emit("tool", "Read  demo-walkthrough.md")
-        time.sleep(0.4)
-        for word in re.findall(r"\S+\s*", text):
-            emit("delta", word)
-            time.sleep(0.035)
-        emit("done", "")
-
-
-class Claude:
-    """One `claude -p` session over the repo, resumed across turns.
-
-    When `parent` is given, the first turn forks that session instead of starting cold, so the
-    chat inherits the terminal conversation's context. Forking (rather than resuming in place)
-    means the user's own terminal session is never written to.
-    """
-
-    def __init__(self, model: str, root: str, parent: str | None = None, brief: str = "",
-                 ):
-        self.model = model
-        self.root = root
-        self.parent = parent
-        self.brief = (
-            "\n\n=== YOUR BRIEF FOR THIS SESSION ===\n\n"
-            + brief.strip()
-            + "\n\nThis brief was written for this session specifically. Where it conflicts with the "
-              "general guidance above, the brief wins.\n"
-        ) if brief.strip() else ""
-
-        self.session_id: str | None = None
-        self.lock = threading.Lock()
-
-    @property
-    def inherited(self) -> str:
-        return INHERITED_NOTE if self.parent else ""
-
-    def _argv(self, prompt: str, system: str, mode: str) -> list[str]:
-        argv = [
-            "claude", "-p", prompt,
-            "--output-format", "stream-json",
-            "--include-partial-messages",
-            "--verbose",
-            "--append-system-prompt", system,
-            "--restricted",
-            "--permission-prompts", "none",
-            "--allowedTools", "Read", "Grep", "Glob", "Write", "Edit", "MultiEdit",
-            "--disallowedTools", "NotebookEdit", "Bash", "WebFetch", "WebSearch", "Task",
-        ]
-        if self.model:
-            argv += ["--model", self.model]
-        if mode == "resume" and self.session_id:
-            argv += ["--resume", self.session_id]
-        elif mode == "fork" and self.parent:
-            argv += ["--resume", self.parent, "--fork-session"]
-        return argv
-
-    def ask(self, prompt: str, system: str, emit):
-        """Run one turn. emit(kind, payload) for 'delta' | 'tool' | 'notice' | 'error' | 'done'."""
-        with self.lock:
-            modes = []
-            if self.session_id:
-                modes.append("resume")
-            elif self.parent:
-                modes.append("fork")
-            modes.append("fresh")
-
-            for mode in modes:
-                try:
-                    ok = self._run(self._argv(prompt, system, mode), emit)
-                except FileNotFoundError:
-                    emit("error", "The `claude` CLI is not on PATH.")
-                    return
-                if ok:
-                    if mode == "fork":
-                        self.parent = None      # the fork is ours now; resume it from here
-                    return
-                if mode == "resume":
-                    self.session_id = None
-                    emit("notice", "Session expired — starting a fresh one.")
-                elif mode == "fork":
-                    self.parent = None
-                    emit("notice", "Could not inherit the terminal session — starting cold.")
-            emit("error", "Claude exited without an answer. Check the terminal for details.")
-
-    def _run(self, argv, emit) -> bool:
-        proc = subprocess.Popen(
-            argv, cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, bufsize=1,
-        )
-        got_text = False
-        for raw in proc.stdout:
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                ev = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            kind = ev.get("type")
-
-            if ev.get("session_id"):
-                self.session_id = ev["session_id"]
-
-            if kind == "stream_event":
-                inner = ev.get("event", {})
-                if inner.get("type") == "content_block_delta":
-                    piece = inner.get("delta", {}).get("text") or ""
-                    if piece:
-                        got_text = True
-                        emit("delta", piece)
-
-            elif kind == "assistant":
-                for block in ev.get("message", {}).get("content", []):
-                    if block.get("type") == "tool_use":
-                        emit("tool", describe_tool(block))
-                    elif block.get("type") == "text" and not got_text and block.get("text"):
-                        got_text = True
-                        emit("delta", block["text"])
-
-            elif kind == "result":
-                if not got_text and ev.get("result"):
-                    got_text = True
-                    emit("delta", ev["result"])
-
-        err = proc.stderr.read()
-        proc.wait()
-        if not got_text:
-            sys.stderr.write(f"[codewalk] claude exited {proc.returncode}: {err.strip()[:500]}\n")
-            return False
-        emit("done", "")
-        return True
-
-
-# Whatever reads a transcript is an agent in a terminal, and an agent handed text ending
-# in an unanswered question will answer it. So the transcript says what it is before it
-# says anything else: someone else's conversation, delivered as context, not as work.
-TRANSCRIPT_NOTE = """\
-# HOW TO READ THIS
-#
-# What follows is a TRANSCRIPT, not a request. It is the conversation the user had with
-# the codewalk session in their browser, delivered here so this session knows what was
-# said. Nothing in it is addressed to you and nothing in it is assigned to you.
-#
-# Read it, say in one or two sentences that you have it and where things stand, and then
-# STOP. Do not implement, verify, test, review, refactor or draft anything it mentions.
-# The last message in it was written TO the user, not BY them: if it ends on a question,
-# that question is still open and only the user can answer it. Pressing Sync is not an
-# answer. Wait for them to type here.
-"""
-
-
-def render_transcript(turns: list, numbered_from: int = 1) -> str:
-    """The dashboard conversation, written so the terminal session can absorb it verbatim."""
-    if not turns:
-        return "(no exchanges — the dashboard was closed without asking anything)\n"
-    out = [f"# Dashboard conversation — {len(turns)} exchange(s)", ""]
-    for i, t in enumerate(turns, numbered_from):
-        out.append(f"## {i}. User")
-        if t["context"].strip():
-            out.append("")
-            out.append("> attached context:")
-            for line in t["context"].strip().split("\n"):
-                out.append("> " + line)
-        out.append("")
-        out.append(t["q"].strip())
-        out.append("")
-        out.append(f"## {i}. Claude")
-        if t["tools"]:
-            out.append("")
-            out.append("_(read: " + "; ".join(t["tools"][:12]) + ")_")
-        out.append("")
-        out.append(t["a"].strip())
-        out.append("")
-    return "\n".join(out) + "\n"
-
-
-def describe_tool(block: dict) -> str:
-    """A one-line, human-readable note for the activity strip."""
-    name = block.get("name", "tool")
-    args = block.get("input", {}) or {}
-    if name == "Read":
-        return "Reading " + short(args.get("file_path", "?"))
-    if name == "Grep":
-        where = args.get("path") or args.get("glob") or ""
-        return f"Searching for {args.get('pattern', '?')!r}" + (f" in {short(where)}" if where else "")
-    if name == "Glob":
-        return f"Listing {args.get('pattern', '?')}"
-    return name
-
-
 def short(path: str) -> str:
-    parts = str(path).replace(os.sep, "/").split("/")
-    return "/".join(parts[-2:]) if len(parts) > 2 else str(path)
+    bits = path.split("/")
+    return path if len(bits) <= 2 else ".../" + "/".join(bits[-2:])
 
 
 # ----------------------------------------------------------------------------------
-# voice
+# the agent's notes, read as an ordered itinerary
 # ----------------------------------------------------------------------------------
 
-PIPER_DIRS = ["~/.local/share/piper/piper", "~/.local/share/piper"]
+# The anchor is the first whitespace-delimited token of the heading, and a path may not
+# contain a colon — which is what makes "where" and "which lines" unambiguous to split.
+ANCHOR_RE = re.compile(r"^(?P<path>[^\s:]+)(?::(?P<a>\d+)(?:\s*-\s*(?P<b>\d+))?)?$")
 
 
-def find_piper() -> tuple[str, str]:
-    """(executable, model) for a local Piper install, or ("", "")."""
-    exe = os.environ.get("CODEWALK_PIPER") or ""
-    if not exe:
-        for d in PIPER_DIRS:
-            cand = os.path.join(os.path.expanduser(d), "piper")
-            if os.path.isfile(cand) and os.access(cand, os.X_OK):
-                exe = cand
-                break
-        else:
-            exe = shutil.which("piper") or ""
-    if not exe:
-        return "", ""
-    model = os.environ.get("CODEWALK_PIPER_MODEL") or ""
-    if not model:
-        # Prefer a high-quality voice, then whatever is there, so an install with
-        # several models does not depend on directory order.
-        here = os.path.dirname(os.path.abspath(exe))
-        onnx = sorted(glob.glob(os.path.join(here, "*.onnx")))
-        if not onnx:
-            return "", ""
-        model = next((m for m in onnx if "-high" in m), onnx[0])
-    return (exe, model) if os.path.isfile(model) else ("", "")
+class Notes:
+    """The agent's notes: a brief, then an ordered list of stops.
 
-
-class Voice:
-    """Piper, kept warm.
-
-    Loading the model costs half a second, which is audible between every sentence, so
-    each speaking rate gets a resident process fed line-delimited JSON. Piper writes the
-    finished wav's path back on stdout, which is the completion signal. Rate cannot be
-    set per line, hence one process per rate rather than one process.
+    The order is the agent's, and it is the one thing this program will not second-guess:
+    the agent wrote the code and is the only party that knows which part has to be read
+    first for the rest to make sense. Files it gave no stop to are not hidden — the page
+    lists them after the last stop — but they are not promoted into the walk either.
     """
 
-    MAX_PROCS = 3
+    def __init__(self, text: str, repo: Repo):
+        self.brief = ""
+        self.stops: list[dict] = []
+        self.problems: list[str] = []
+        self._parse(text or "", repo)
 
-    def __init__(self, exe: str, model: str):
-        self.exe, self.model = exe, model
-        self.procs: dict[float, dict] = {}
-        self.lock = threading.Lock()
-        self.dir = os.path.join(cache_root(), "tts")
-        os.makedirs(self.dir, exist_ok=True)
+    def _parse(self, text: str, repo: Repo) -> None:
+        head: list[str] = []
+        sink = head
+        for raw in text.split("\n"):
+            m = re.match(r"^##\s+(\S+)\s*(.*)$", raw)
+            if not m:
+                sink.append(raw)
+                continue
+            cur = self._stop(m.group(1), m.group(2).strip(), repo)
+            if cur is None:
+                sink = []        # the heading was not an anchor; its prose goes nowhere
+                continue
+            self.stops.append(cur)
+            sink = cur["note"]
+        self.brief = "\n".join(head).strip()
+        for s in self.stops:
+            s["note"] = "\n".join(s["note"]).strip()
 
-    @property
-    def available(self) -> bool:
-        return bool(self.exe and self.model)
+    def _stop(self, anchor: str, title: str, repo: Repo) -> dict | None:
+        m = ANCHOR_RE.match(anchor)
+        if not m:
+            self.problems.append(f"Not a path:line anchor, so this note has no stop: `{anchor}`")
+            return None
+        rel = m.group("path").lstrip("./")
+        a = int(m.group("a")) if m.group("a") else 0
+        b = int(m.group("b")) if m.group("b") else a
+        full = repo.resolve(rel)
+        missing = full is None or not os.path.isfile(full)
+        if missing:
+            self.problems.append(f"No such file, so stop {len(self.stops) + 1} has nothing to "
+                                 f"open: `{rel}`")
+        return {
+            "n": len(self.stops) + 1, "path": rel, "a": a, "b": max(a, b),
+            "title": title, "note": [], "missing": missing,
+        }
 
-    def _proc(self, scale: float) -> dict:
-        p = self.procs.get(scale)
-        if p and p["proc"].poll() is None:
-            p["used"] = time.time()
-            return p
-        if len(self.procs) >= self.MAX_PROCS:
-            old = min(self.procs, key=lambda k: self.procs[k]["used"])
-            self._kill(old)
-        proc = subprocess.Popen(
-            [self.exe, "--model", self.model, "--json-input", "--quiet",
-             "--length_scale", f"{scale:.3f}", "--sentence_silence", "0.1"],
-            cwd=self.dir, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, bufsize=1,
-        )
-        p = {"proc": proc, "lock": threading.Lock(), "used": time.time()}
-        self.procs[scale] = p
-        return p
+    def payload(self) -> dict:
+        return {"brief": self.brief, "stops": self.stops, "problems": self.problems}
 
-    def _kill(self, scale: float) -> None:
-        p = self.procs.pop(scale, None)
-        if not p:
-            return
-        try:
-            p["proc"].stdin.close()
-            p["proc"].terminate()
-        except Exception:
-            pass
-
-    def say(self, text: str, rate: float) -> bytes:
-        """Synthesize one chunk. Returns wav bytes, or b'' if Piper failed."""
-        text = " ".join(text.split())
-        if not text:
-            return b""
-        scale = round(min(2.0, max(0.4, 1.0 / max(0.3, rate))), 3)
-        for attempt in (1, 2):                 # a dead process is respawned once
-            with self.lock:
-                p = self._proc(scale)
-            out = os.path.join(self.dir, f"cw{os.getpid()}-{threading.get_ident()}.wav")
-            try:
-                with p["lock"]:
-                    p["proc"].stdin.write(json.dumps({"text": text, "output_file": out}) + "\n")
-                    p["proc"].stdin.flush()
-                    line = p["proc"].stdout.readline()
-                if not line:
-                    raise OSError("piper closed")
-                with open(out, "rb") as fh:
-                    data = fh.read()
-                return data
-            except Exception:
-                with self.lock:
-                    self._kill(scale)
-                if attempt == 2:
-                    return b""
-            finally:
-                try:
-                    os.unlink(out)
-                except OSError:
-                    pass
-        return b""
-
-    def shutdown(self) -> None:
-        with self.lock:
-            for scale in list(self.procs):
-                self._kill(scale)
 
 # ----------------------------------------------------------------------------------
-# http
+# what you send back
+# ----------------------------------------------------------------------------------
+
+class Comments:
+    """Your side of the round, held here and printed when you press Send.
+
+    Two kinds of thing go back: a VERDICT on something the agent proposed — a stop, or a
+    hunk it gave no stop to — and a COMMENT, which is prose about particular lines. They
+    are kept apart because they answer different questions. "Is this right?" is not the
+    same question as "here is what I noticed", and an agent that cannot tell them apart
+    will rewrite code you only asked about.
+
+    The browser is the only writer and sends the whole state each time, so there is no
+    incremental state to get out of step. It is kept server-side at all because a tab that
+    gets closed by accident should not take the review you typed with it.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.items: list[dict] = []        # comments
+        self.verdicts: list[dict] = []     # approve / reject
+        self.general = ""
+        self.sent = threading.Event()
+
+    def put(self, body: dict) -> int:
+        with self.lock:
+            self.items = [i for i in (body.get("items") or []) if isinstance(i, dict)]
+            self.verdicts = [v for v in (body.get("verdicts") or []) if isinstance(v, dict)]
+            self.general = str(body.get("general") or "")
+            return self._count()
+
+    def _count(self) -> int:
+        return len(self.items) + len(self.verdicts) + (1 if self.general.strip() else 0)
+
+    def count(self) -> int:
+        with self.lock:
+            return self._count()
+
+    def draft(self) -> dict:
+        """Everything said so far, so a review you stepped away from is still there when
+        you come back to it."""
+        with self.lock:
+            return {"items": list(self.items), "verdicts": list(self.verdicts),
+                    "general": self.general}
+
+    def render(self, root: str, base: str, submitted: bool, changed: list,
+               stops: list | None = None) -> str:
+        with self.lock:
+            items, verdicts, general = list(self.items), list(self.verdicts), self.general
+            n = self._count()
+
+        ok = [v for v in verdicts if v.get("state") == "approve"]
+        no = [v for v in verdicts if v.get("state") == "reject"]
+        tally = ", ".join(
+            p for p in (
+                f"{len(ok)} approved" if ok else "",
+                f"{len(no)} rejected" if no else "",
+                f"{len(items)} comment(s)" if items else "",
+                "a general note" if general.strip() else "",
+            ) if p
+        )
+        out = [f"# codewalk review — {tally}" if tally else "# codewalk review — nothing said"]
+        out.append(f"# {root}" + (f"   ·   base {base}" if base else ""))
+        if not submitted:
+            out += ["#",
+                    "# The tab was closed without pressing Send. This is what had been "
+                    "written by then;",
+                    "# ask before treating it as the finished review."]
+        out.append("")
+        if not n:
+            out.append("Nothing was flagged." if submitted else
+                       "Nothing had been written down.")
+            return "\n".join(out)
+
+        # One section per thing reviewed, so a verdict and the comments explaining it read
+        # together instead of twice. Stop order first, because that is the order the agent
+        # asked for and so the order the reading actually happened in.
+        sections: dict = {}
+        order: list = []
+        for it in verdicts + items:
+            key = str(it.get("key") or (it.get("path"), it.get("a"), it.get("b")))
+            if key not in sections:
+                sections[key] = {"head": it, "state": "", "notes": [], "rows": []}
+                order.append(key)
+            sec = sections[key]
+            if it.get("state"):
+                sec["state"] = str(it["state"])
+            if it.get("note"):
+                sec["notes"].append(str(it["note"]))
+            if it.get("rows") and not sec["rows"]:
+                sec["rows"] = it["rows"]
+
+        order.sort(key=lambda k: (sections[k]["head"].get("stop") or 10**6,
+                                  str(sections[k]["head"].get("path")),
+                                  sections[k]["head"].get("a") or 0))
+        for key in order:
+            out.append(self._one(sections[key]))
+
+        if general.strip():
+            out.append("## general")
+            out += ["> " + l for l in general.strip().split("\n")]
+            out.append("")
+
+        # What was never judged at all. Silence is not approval, and it has to be reported
+        # per STOP as well as per path: a stop skipped inside a file that was otherwise
+        # reviewed used to disappear without trace, because the file itself looked covered.
+        keys = {str(i.get("key")) for i in verdicts + items}
+        touched = {str(i.get("path")) for i in verdicts + items}
+        judged = {str(v.get("key")) for v in verdicts}
+        missed = []
+        for st in (stops or []):
+            if "stop:%d" % st["n"] in judged:
+                continue
+            where = st["path"] + (f":{st['a']}" if st["a"] and st["a"] == st["b"]
+                                  else f":{st['a']}-{st['b']}" if st["a"] else "")
+            said = " (commented on, but no verdict)" if "stop:%d" % st["n"] in keys else ""
+            missed.append(f"stop {st['n']} \u2014 {where}"
+                          + (f'  "{st["title"]}"' if st.get("title") else "") + said)
+        rest = [e["path"] for e in changed if e["path"] not in touched]
+        if missed or rest:
+            out.append("## not reviewed")
+            if missed:
+                out.append("> These stops were passed over:")
+                out += ["> " + "  " + m for m in missed]
+            if rest:
+                out.append("> No verdict and no comment on these changed paths:")
+                out += ["> " + "  " + p for p in rest]
+            out.append("")
+        return "\n".join(out)
+
+    def _one(self, sec: dict) -> str:
+        it = sec["head"]
+        path = str(it.get("path") or "?")
+        a, b = it.get("a") or 0, it.get("b") or 0
+        where = path + (f":{a}" if a and a == b else f":{a}-{b}" if a else "")
+        head = f"## stop {it['stop']} — {where}" if it.get("stop") else f"## {where}"
+        if it.get("title"):
+            head += f'  "{it["title"]}"'
+        if sec["state"]:
+            head += "   [" + {"approve": "APPROVED", "reject": "REJECTED"}.get(
+                sec["state"], sec["state"].upper()) + "]"
+        out = [head]
+        rows = sec["rows"] or []
+        for r in rows[:60]:
+            if not isinstance(r, dict):
+                continue
+            mark = {"add": "+", "del": "-"}.get(str(r.get("m") or ""), " ")
+            out.append(f"  {mark} {str(r.get('n') or ''):>5}  {r.get('t') or ''}")
+        if len(rows) > 60:
+            out.append(f"  … {len(rows) - 60} more line(s)")
+        for note in sec["notes"]:
+            for l in note.strip().split("\n"):
+                out.append("> " + l)
+        if sec["state"] == "reject" and not sec["notes"]:
+            out.append("> (rejected with no reason given)")
+        out.append("")
+        return "\n".join(out)
+
+
+# ----------------------------------------------------------------------------------
+# one submitted review, and the queue of them
+# ----------------------------------------------------------------------------------
+
+class Request:
+    """One review an agent has asked for, and everything needed to serve it.
+
+    It carries its own repo root and base commit, because the agents submitting are working
+    in different checkouts at the same time. Nothing here is shared between reviews except
+    the port they arrive on.
+    """
+
+    PENDING = "pending"      # queued, nobody has opened it
+    READING = "reading"      # the dashboard has it open
+    ANSWERED = "answered"    # sent back; the agent has it or is about to
+    GONE = "gone"            # the agent stopped waiting
+
+    def __init__(self, title: str, root: str, notes_text: str, base: str | None, agent: str):
+        self.id = hashlib.sha256(
+            f"{time.time()}{root}{title}".encode("utf-8")).hexdigest()[:8]
+        self.title = title.strip() or "untitled review"
+        self.agent = agent.strip()
+        self.created = time.time()
+        self.state = Request.PENDING
+        self.last_seen = time.time()      # the agent is still on the other end
+        self.opened = 0.0
+        self.repo = Repo(root)
+        self.changes = Changes(self.repo, base)
+        self.notes = Notes(notes_text, self.repo)
+        self.comments = Comments()
+        self.answered = threading.Event()
+
+    def touch(self) -> None:
+        self.last_seen = time.time()
+        if self.state == Request.GONE:
+            self.state = Request.PENDING
+
+    def waiting(self) -> bool:
+        """Is anyone still listening? An agent that has given up leaves a review nobody
+        will ever read the answer to, and saying so is kinder than letting it look live."""
+        return time.time() - self.last_seen < 90
+
+    def card(self) -> dict:
+        """What the list shows. Counted lazily, because a queue of twenty reviews should not
+        diff twenty repositories to draw one screen."""
+        changed = self.changes.entries()
+        return {
+            "id": self.id,
+            "title": self.title,
+            "agent": self.agent,
+            "repo": self.repo.name,
+            "root": self.repo.root,
+            "base": self.changes.label(),
+            "files": len(changed),
+            "added": sum(e["added"] for e in changed if e["added"] > 0),
+            "removed": sum(e["removed"] for e in changed if e["removed"] > 0),
+            "stops": len(self.notes.stops),
+            "state": self.state,
+            "waiting": self.waiting(),
+            "age": int(time.time() - self.created),
+            "answered_with": self.comments.count() if self.state == Request.ANSWERED else 0,
+        }
+
+    def boot(self) -> dict:
+        return {
+            "id": self.id,
+            "title": self.title,
+            "agent": self.agent,
+            "root": self.repo.root,
+            "name": self.repo.name,
+            "git": self.repo.is_git,
+            "base": self.changes.label(),
+            "files": self.repo.files(),
+            "changes": self.changes.entries(),
+            "review": self.notes.payload(),
+            "state": self.state,
+            "waiting": self.waiting(),
+            "draft": self.comments.draft(),
+        }
+
+
+class Queue:
+    """Every review the dashboard knows about, newest first.
+
+    Memory only. The dashboard is the long-running process and the agents are the
+    short-lived ones, so there is nothing a restart could usefully preserve: a client whose
+    review vanished finds out on its next poll and says so.
+    """
+
+    KEEP_ANSWERED = 25
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.items: list[Request] = []
+
+    def add(self, req: Request) -> None:
+        with self.lock:
+            self.items.insert(0, req)
+            done = [r for r in self.items if r.state == Request.ANSWERED]
+            for old in done[Queue.KEEP_ANSWERED:]:
+                self.items.remove(old)
+
+    def get(self, rid: str) -> Request | None:
+        with self.lock:
+            for r in self.items:
+                if r.id == rid:
+                    return r
+        return None
+
+    def cards(self) -> dict:
+        with self.lock:
+            items = list(self.items)
+        for r in items:
+            if r.state in (Request.PENDING, Request.READING) and not r.waiting():
+                r.state = Request.GONE
+        pending = [r.card() for r in items if r.state in (Request.PENDING, Request.READING)]
+        stale = [r.card() for r in items if r.state == Request.GONE]
+        done = [r.card() for r in items if r.state == Request.ANSWERED]
+        return {"pending": pending, "stale": stale, "done": done[:8]}
+
+
+# ----------------------------------------------------------------------------------
+# the server
 # ----------------------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "codewalk"
-    repo: Repo
-    claude: Claude
-    context_label: str = ""
-    handoff: bool = False
-    transcript: list = []
-    transcript_path: str | None = None
-    handback = threading.Event()
-    last_ping: float = 0.0
-    sync_path: str | None = None
-    synced_upto: int = 0
-    changes: "Changes" = None    # type: ignore[assignment]
-    tree: "Worktree" = None      # type: ignore[assignment]
-    first_question: str = ""
-    models: list = []
-    voice: "Voice" = None      # type: ignore[assignment]
-    voice_on: bool = False     # the page is reading answers aloud
+    queue: "Queue" = None    # type: ignore[assignment]
 
     def log_message(self, fmt, *args):
         pass
@@ -1378,207 +833,113 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError):
             return {}
 
+    # -- routing ---------------------------------------------------------------
+    # Everything about one review lives under /api/r/<id>/, so the page never has to hold a
+    # review id and a path in the same string, and two reviews of two repositories cannot
+    # read each other's files.
+    def _review(self, rest: str):
+        rid, _, tail = rest.partition("/")
+        req = Handler.queue.get(rid)
+        if req is None:
+            self._json({"error": "No such review. The dashboard may have been restarted."}, 404)
+            return None, ""
+        return req, tail.split("?", 1)[0]
+
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         if path == "/":
-            self._send(200, "text/html; charset=utf-8", PAGE.encode("utf-8"))
-        elif path == "/api/ping":
-            Handler.last_ping = time.time()      # the tab is still open (fetch() == GET)
-            self._json({"ok": True})
-        elif path == "/api/tree":
-            self._json({
-                "root": self.repo.root,
-                "name": self.repo.name,
-                "git": self.repo.is_git,
-                "context": Handler.context_label,
-                "handoff": Handler.handoff,
-                "first_question": Handler.first_question,
-                "sync": bool(Handler.sync_path),
-                "tts": Handler.voice.available,
-                "model": self.claude.model,
-                "models": Handler.models,
-                "files": self.repo.files(),
-            })
-        elif path == "/api/file":
-            res = self.repo.read(self._query().get("path", ""))
-            self._json(res, 200 if "error" not in res else 404)
-        elif path == "/api/files":
-            self._json({"files": self.repo.files()})
-        elif path == "/api/changes":
-            self._json({"items": Handler.changes.entries(), "base": Handler.changes.label(),
-                        "accept": Handler.tree is not None,
-                        "source": Handler.tree.source if Handler.tree else ""})
-        elif path == "/api/change":
-            res = Handler.changes.read(self._query().get("path", ""))
-            self._json(res, 200 if "error" not in res else 404)
-        elif path == "/api/watch":
-            rel = self._query().get("path", "")
-            try:
-                seen = float(self._query().get("mtime", "0"))
-            except ValueError:
-                seen = 0.0
-            deadline = time.time() + 25
-            while time.time() < deadline:
-                now = self.repo.mtime(rel)
-                if now and now != seen:
-                    res = self.repo.read(rel)
-                    if "error" not in res:
-                        self._json({"changed": True, **res})
-                        return
-                time.sleep(0.4)
-            self._json({"changed": False})
+            body = PAGE.replace("__STAMP__", page_stamp())
+            self._send(200, "text/html; charset=utf-8", body.encode("utf-8"))
+        elif path == "/api/queue":
+            self._json({"stamp": page_stamp(), **Handler.queue.cards()})
+        elif path == "/api/wait":
+            self._wait()
+        elif path.startswith("/api/r/"):
+            req, tail = self._review(path[len("/api/r/"):])
+            if req is None:
+                return
+            if tail == "":
+                if req.state == Request.PENDING:
+                    req.state = Request.READING
+                    req.opened = time.time()
+                self._json(req.boot())
+            elif tail == "file":
+                res = req.repo.read(self._query().get("path", ""))
+                self._json(res, 200 if "error" not in res else 404)
+            elif tail == "change":
+                res = req.changes.read(self._query().get("path", ""))
+                self._json(res, 200 if "error" not in res else 404)
+            else:
+                self._send(404, "text/plain", b"not found")
         else:
             self._send(404, "text/plain", b"not found")
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
-        if path == "/api/apply":
-            b = self._body()
-            try:
-                res = self.repo.apply(
-                    str(b["path"]), int(b["start"]), int(b["end"]),
-                    str(b["text"]), str(b.get("digest", "")),
-                )
-            except (KeyError, TypeError, ValueError):
-                res = {"ok": False, "error": "Malformed edit."}
-            self._json(res)
-        elif path == "/api/accept":
-            if Handler.tree is None:
-                self._json({"ok": False, "error": "Not running on a worktree."}, 400)
+        if path == "/api/submit":
+            self._submit()
+        elif path.startswith("/api/r/"):
+            req, tail = self._review(path[len("/api/r/"):])
+            if req is None:
                 return
-            res = Handler.tree.accept(Handler.changes.entries(), Handler.changes.base() or "")
-            if res.get("ok"):
-                # From here the list measures against what was just accepted, so it empties
-                # and fills again only with whatever the agent does next.
-                Handler.changes.rebase(res["commit"], name="last accepted")
-            self._json(res)
-        elif path == "/api/sync":
-            b = self._body()
-            self._json(Handler.sync(bool(b.get("close"))))
-            if b.get("close"):
-                Handler.handback.set()
-        elif path == "/api/handback":
-            self._json({"ok": True, "turns": len(Handler.transcript)})
-            Handler.handback.set()
-        elif path == "/api/ask":
-            b = self._body()
-            Handler.voice_on = bool(b.get("voice"))
-            self._ask(b.get("q", ""), b.get("context", ""))
-        elif path == "/api/tts":
-            b = self._body()
-            try:
-                rate = float(b.get("rate") or 1.0)
-            except (TypeError, ValueError):
-                rate = 1.0
-            wav = Handler.voice.say(str(b.get("text") or ""), rate)
-            if not wav:
-                self._json({"ok": False, "error": "tts failed"}, 503)
-                return
-            self._send(200, "audio/wav", wav)
-        elif path == "/api/model":
-            b = self._body()
-            want = str(b.get("model") or "")
-            if want not in Handler.models:
-                self._json({"ok": False, "error": "unknown model"}, 400)
-                return
-            self.claude.model = want
-            self._json({"ok": True, "model": want})
+            if tail in ("draft", "send"):
+                b = self._body()
+                n = req.comments.put(b)
+                if tail == "send":
+                    req.state = Request.ANSWERED
+                    req.answered.set()
+                self._json({"ok": True, "count": n})
+            elif tail == "defer":
+                # Put it back on the pile without answering: a review you open and then
+                # decide to come back to should not look like one you are in the middle of.
+                if req.state == Request.READING:
+                    req.state = Request.PENDING
+                self._json({"ok": True})
+            else:
+                self._send(404, "text/plain", b"not found")
         else:
             self._send(404, "text/plain", b"not found")
 
-    def _system(self) -> str:
-        # The brief still outranks everything; the voice note sits just above it because
-        # how to phrase an answer is a smaller matter than what the answer is about.
-        brief = (VOICE_NOTE + self.claude.brief) if Handler.voice_on else self.claude.brief
-        return RULES.format(
-            root=self.repo.root, inherited=self.claude.inherited, brief=brief,
-            base=Handler.changes.label() or "the base commit",
-        )
-
-    def _ask(self, question: str, context: str):
-        question = (question or "").strip()
-        if not question:
-            self._json({"error": "empty"}, 400)
+    # -- what agents call ------------------------------------------------------
+    def _submit(self):
+        b = self._body()
+        root = str(b.get("root") or "")
+        if not os.path.isdir(root):
+            self._json({"ok": False, "error": f"not a directory: {root}"}, 400)
             return
-
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Accel-Buffering", "no")
-        self.end_headers()
-
-        prompt = (context.strip() + "\n\n" + question) if context.strip() else question
-        system = self._system()
-        q: queue.Queue = queue.Queue()
-
-        threading.Thread(
-            target=self.claude.ask,
-            args=(prompt, system, lambda k, v: q.put((k, v))),
-            daemon=True,
-        ).start()
-
-        answer, tools = [], []
-        while True:
-            try:
-                kind, payload = q.get(timeout=600)
-            except queue.Empty:
-                kind, payload = "error", "Timed out waiting for Claude."
-            if kind == "delta":
-                answer.append(payload)
-            elif kind == "tool":
-                tools.append(payload)
-            try:
-                self.wfile.write(f"data: {json.dumps({'k': kind, 'v': payload})}\n\n".encode("utf-8"))
-                self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                kind = "done"
-            if kind in ("done", "error"):
-                Handler.record(question, context, "".join(answer), tools)
-                return
-
-    def _event(self, kind: str, payload: str) -> None:
-        try:
-            self.wfile.write(f"data: {json.dumps({'k': kind, 'v': payload})}\n\n".encode("utf-8"))
-            self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-
-    @classmethod
-    def sync(cls, closing: bool) -> dict:
-        """Publish everything said since the last sync, for the terminal session to pick up."""
-        if not cls.sync_path:
-            return {"ok": False, "error": "This dashboard was not started with --sync-file."}
-        fresh = cls.transcript[cls.synced_upto:]
-        if not fresh and not closing:
-            return {"ok": False, "error": "Nothing new to sync."}
-        header = (
-            TRANSCRIPT_NOTE
-            + "#\n# Synced from the codewalk dashboard"
-            + (" (session closed)" if closing else " — the user is still in the browser")
-            + f", {len(fresh)} new exchange(s).\n\n"
+        req = Request(
+            title=str(b.get("title") or ""),
+            root=root,
+            notes_text=str(b.get("notes") or ""),
+            base=(str(b.get("base")) if b.get("base") else None),
+            agent=str(b.get("agent") or ""),
         )
-        body = header + render_transcript(fresh, numbered_from=cls.synced_upto + 1)
-        tmp = cls.sync_path + ".part"
-        try:
-            with open(tmp, "w", encoding="utf-8") as fh:
-                fh.write(body)
-            os.replace(tmp, cls.sync_path)      # atomic: the watcher never sees a half file
-        except OSError as e:
-            return {"ok": False, "error": f"Could not write the sync file: {e}"}
-        cls.synced_upto = len(cls.transcript)
-        return {"ok": True, "synced": len(fresh)}
+        Handler.queue.add(req)
+        card = req.card()
+        print(f"  + {req.id}  {req.title}   ({card['repo']}: {card['files']} file(s), "
+              f"{card['stops']} stop(s))", flush=True)
+        self._json({"ok": True, "id": req.id, **card})
 
-    @classmethod
-    def record(cls, question, context, answer, tools):
-        cls.transcript.append({
-            "q": question, "context": context, "a": answer, "tools": tools,
-        })
-        if cls.transcript_path:
-            try:
-                with open(cls.transcript_path, "w", encoding="utf-8") as fh:
-                    fh.write(render_transcript(cls.transcript))
-            except OSError:
-                pass
+    def _wait(self):
+        """Long poll. The agent holds this open; it returns the moment you press Send."""
+        q = self._query()
+        req = Handler.queue.get(str(q.get("id") or ""))
+        if req is None:
+            self._json({"state": "unknown"}, 404)
+            return
+        try:
+            secs = max(1.0, min(60.0, float(q.get("for") or 25)))
+        except ValueError:
+            secs = 25.0
+        req.touch()
+        if req.answered.wait(timeout=secs):
+            self._json({
+                "state": Request.ANSWERED,
+                "text": req.comments.render(req.repo.root, req.changes.label(), True,
+                                            req.changes.entries(), req.notes.stops),
+            })
+            return
+        self._json({"state": req.state, "title": req.title})
 
 
 PAGE = r"""<!doctype html>
@@ -1595,21 +956,31 @@ PAGE = r"""<!doctype html>
   --fg: #d4d4d4; --fg-dim: #cccccc; --fg-faint: #858585;
   --accent: #007acc; --btn: #0e639c; --btn-hover: #1177bb;
   /* Row washes are deliberately faint — the left rail is the signal, the tint is only
-     a hint, so syntax colours underneath stay readable. Turn them up here if you want. */
+     a hint, so syntax colours underneath stay readable. */
   --hl-bg: rgba(215,186,125,0.09); --hl-rail: #d7ba7d; --sel-bg: rgba(0,122,204,0.20);
-  --chip-bg: #3a3116;
-  --add: rgba(78,201,176,0.14); --del: rgba(244,71,71,0.13);
-  /* Git status, and nothing else. Deliberately not the highlight amber: what the file's
+  --add: rgba(78,201,176,0.15); --del: rgba(244,71,71,0.14);
+  /* The same two colours, faint. Every change stays visible so the shape of the diff is
+     still readable at a glance, but only the one you are deciding on is lit. */
+  --add-off: rgba(78,201,176,0.045); --del-off: rgba(244,71,71,0.04);
+  /* Git status, and nothing else. Deliberately not the highlight amber: what a file's
      state is and what is being pointed at are unrelated questions. */
   --git-new: #4fa3e3; --git-mod: #e2a03f; --git-del: #f44747;
-  /* The user rejecting something is neither a git state nor a highlight, so it gets its
-     own colour rather than borrowing one that already means something else. */
-  --rej: rgba(197,134,192,0.20); --rej-fg: #c586c0;
-  --red: #f44747; --green: #4ec9b0; --purple: #68217a;
+  /* The two voices in the margin. They must never be confusable: one is the agent saying
+     what it did, the other is you saying what you think of it. */
+  --them: #4ec9b0; --them-bg: rgba(78,201,176,0.07);
+  --me: #c586c0; --me-bg: rgba(197,134,192,0.10);
+  --red: #f44747; --green: #4ec9b0;
+  /* A verdict is not a note and must not read like one: yes and no, in the two colours
+     every reviewer already knows, and used for nothing else in the page. */
+  --ok: #4ec9b0; --no: #f05f5f;
+  --gutter: 62px;
   --mono: ui-monospace, "Cascadia Code", "Droid Sans Mono", Consolas, "Courier New", monospace;
   --ui: system-ui, "Segoe UI", Ubuntu, "Droid Sans", sans-serif;
 }
 * { box-sizing: border-box; }
+/* Every pane here is laid out with an explicit `display`, which outranks the hidden
+   attribute's own rule — so without this, hiding a view does nothing at all. */
+[hidden] { display: none !important; }
 html, body { height: 100%; }
 body {
   margin: 0; background: var(--bg-editor); color: var(--fg);
@@ -1626,99 +997,46 @@ body {
   padding: 0 10px; gap: 12px; font-size: 12px; color: var(--fg-dim); user-select: none;
 }
 .titlebar .brand { color: var(--fg-faint); letter-spacing: 0.09em; text-transform: uppercase; font-size: 10px; }
-#handback, #syncbar button {
-  font: inherit; font-size: 11px; font-family: var(--ui); background: var(--btn); color: #fff;
-  border: 0; border-radius: 2px; padding: 3px 10px; cursor: pointer;
-}
-#syncbar { margin-left: auto; display: flex; gap: 6px; align-items: center; }
-#handback { margin-left: auto; }
-#syncbar + #handback { margin-left: 6px; }
-#handback:hover:not(:disabled), #syncbar button:hover:not(:disabled) { background: var(--btn-hover); }
-#handback:disabled, #syncbar button:disabled { background: #2d2d2d; color: var(--fg-faint); cursor: default; }
-#syncbar button.ghost { background: transparent; color: var(--fg-dim); border: 1px solid var(--border); }
-#syncbar button.ghost:hover:not(:disabled) { background: var(--bg-hover); color: #fff; }
-#syncnote { font-size: 11px; color: var(--green); margin-left: 2px; }
-/* Change state belongs ON the tree, not in a second list beside it: one place to look for
-   "where is the code", whether or not it has been touched. The bar is only the count and
-   the two verbs that have nowhere else to live. */
-#allGood {
-  flex: 0 0 auto; margin: 0; padding: 9px 8px; border: 0; border-top: 1px solid var(--border);
-  background: var(--btn); color: #fff; font: inherit; font-size: 11.5px; cursor: pointer;
-  letter-spacing: 0.04em;
-}
-#allGood:hover { background: var(--btn-hover); }
-#allGood.warn { background: transparent; color: var(--rej-fg); border-top-color: var(--rej-fg); }
-/* The bar that opens each hunk: what it does to the file, and the two decisions. */
-/* The pane scrolls in BOTH directions, so anything laid out in the flow of the code can be
-   pushed off the side by one long line or off the top by one long hunk. The band spans the
-   content so it reads as a divider; the controls inside it are stuck to the left edge of
-   the viewport and to the top of their own hunk, which is the only way to promise they are
-   on screen when they are needed. */
-.hunk { position: relative; }
-.hbar {
-  position: sticky; top: 0; z-index: 2;
-  display: flex; align-items: center; padding: 2px 10px 2px 0;
-  font-family: var(--ui); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase;
-  color: var(--fg-faint); background: var(--bg-side);
-  border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
-}
-.hbar .grp {
-  position: sticky; left: 0; display: inline-flex; align-items: center; gap: 8px;
-  padding: 1px 10px 1px 10px; background: var(--bg-side);
-}
-.hbar .l { font-family: var(--mono); letter-spacing: 0; text-transform: none;
-           min-width: 56px; color: var(--fg-dim); }
-.hbar.accept { color: var(--green); }
-.hbar.reject { color: var(--rej-fg); }
-.hbar .hb {
-  font: inherit; font-size: 10px; border: 1px solid var(--border); border-radius: 2px;
-  background: transparent; color: var(--fg-dim); padding: 1px 7px; cursor: pointer;
-}
-.hbar .hb:hover { background: var(--bg-hover); color: #fff; }
-.hbar .hb.ok:hover { border-color: var(--green); color: var(--green); }
-.hbar .hb.no:hover { border-color: var(--rej-fg); color: var(--rej-fg); }
-/* A rejected hunk stays on screen and changes hands: it stops being the agent's proposal
-   and becomes something the user is pointing at, the way a Ctrl-L selection is. */
-.ln.rv-reject { background: var(--rej); border-left-color: var(--rej-fg); }
-.ln.rv-accept.add { background: rgba(78,201,176,0.07); }
-.ln.rv-accept.del { background: transparent; }
-.ln.rv-accept.del .no { color: #4a4a4a; }
-.ln.rv-accept.del .src, .ln.rv-accept.del .src span {
-  color: #5a5a5a; text-decoration: line-through; text-decoration-thickness: 1px;
-}
-/* A changed file reads as changed at a glance: the dot carries the state, the name brightens,
-   and the counts sit at the end where they do not push the name around. */
-/* The dot carries one meaning: what git says about this file. An untouched file has no
-   dot at all, so a coloured one always means something happened. */
-.node .dot, .tab .dot { background: transparent; }
-.node.file.chg .dot, .tab .dot.chg { background: var(--git-mod); }
-.node.file.chg-new .dot, .tab .dot.chg-new { background: var(--git-new); }
-.node.file.chg-deleted .dot, .tab .dot.chg-deleted { background: var(--git-del); }
-.node.file.chg .lbl { color: #fff; }
-.node.file.chg-deleted .lbl { text-decoration: line-through; text-decoration-thickness: 1px;
-                              color: var(--fg-dim); }
-/* The proposal view: what would go, then what would arrive, in the real file around them. */
-/* Tinted background, untouched foreground: the code stays as legible as it is in the file
-   itself, and the tint is the only thing the diff adds. */
-.ln.del { background: var(--del); }
-.ln.add { background: var(--add); }
-.ln.del .no, .ln.add .no { color: var(--fg-dim); }
-.node .num { margin-left: auto; padding-left: 8px; font-family: var(--mono); font-size: 9.5px; }
-.node .num .a { color: var(--green); }
-.node .num .r { color: var(--red); }
-/* A collapsed directory still has to say that something inside it moved. */
-.node.dir.chg > .lbl { color: #fff; }
-.node.dir.chg > .lbl::after {
-  content: "\2022"; color: var(--git-mod); font-size: 14px; margin-left: 6px; vertical-align: middle;
-}
-.tab .state { color: var(--hl-rail); font-size: 9px; letter-spacing: 0.06em; margin-left: 4px; }
 .titlebar .center { flex: 1; text-align: center; color: var(--fg-faint); }
+.titlebar .base { font-family: var(--mono); font-size: 11px; color: var(--fg-faint); }
 
 .main { flex: 1 1 auto; display: flex; min-height: 0; }
+
+/* The queue. It shows what a review IS and which project it is in, and nothing else:
+   anything more and you are reading the list instead of picking from it. */
+#home { flex: 1 1 auto; overflow-y: auto; background: var(--bg-editor); }
+.hwrap { max-width: 620px; margin: 0 auto; padding: 14vh 24px 80px; }
+.qcard {
+  display: flex; align-items: baseline; gap: 12px; width: 100%; text-align: left;
+  font: inherit; cursor: pointer; background: transparent; border: 0;
+  border-bottom: 1px solid var(--border-2); padding: 14px 4px; color: var(--fg);
+}
+.qcard:hover { background: var(--bg-hover); }
+.qcard .n {
+  flex: 0 0 18px; font-family: var(--mono); font-size: 11px; color: var(--fg-faint);
+  text-align: right;
+}
+.qcard:hover .n { color: var(--hl-rail); }
+.qcard .t { font-size: 15px; color: #fff; }
+.qcard .m {
+  margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--fg-faint);
+  white-space: nowrap;
+}
+.qcard.stale { opacity: 0.45; }
+.qcard.stale .t { color: var(--fg-dim); }
+.qnone { color: var(--fg-faint); font-size: 12.5px; padding: 14px 4px; }
+#qnote {
+  font-size: 12px; color: var(--ok); padding: 0 4px 14px; letter-spacing: 0.01em;
+}
+#back {
+  font: inherit; font-size: 14px; line-height: 1; background: transparent; color: var(--fg-dim);
+  border: 1px solid transparent; border-radius: 2px; padding: 1px 8px; cursor: pointer;
+}
+#back:hover { background: var(--bg-hover); border-color: var(--border); }
 .pane { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
 #explorer { flex: 0 0 250px; background: var(--bg-side); }
 #editor { flex: 1 1 auto; background: var(--bg-editor); }
-#chat { flex: 0 0 400px; background: var(--bg-side); border-left: 1px solid var(--border-2); }
+#review { flex: 0 0 420px; background: var(--bg-side); border-left: 1px solid var(--border-2); }
 .sash { flex: 0 0 4px; cursor: col-resize; background: transparent; }
 .sash:hover, .sash.dragging { background: var(--accent); }
 
@@ -1735,11 +1053,11 @@ body {
 }
 .iconbtn:hover:not(:disabled) { color: var(--fg-dim); background: var(--bg-hover); }
 .iconbtn:disabled { opacity: 0.4; cursor: default; }
-select.iconbtn { padding: 2px 4px; text-transform: none; letter-spacing: 0; }
-.iconbtn.wants { color: var(--hl-rail); border-color: var(--hl-rail); }
-.rateWrap { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--fg-faint); }
-.rateWrap input { width: 74px; accent-color: var(--hl-rail); cursor: pointer; }
-.rateWrap #rateVal { font-family: var(--mono); min-width: 34px; text-align: right; }
+.btn { font: inherit; font-size: 11px; background: var(--btn); color: #fff; border: 0; border-radius: 2px; padding: 4px 11px; cursor: pointer; }
+.btn:hover:not(:disabled) { background: var(--btn-hover); }
+.btn.ghost { background: transparent; color: var(--fg-faint); border: 1px solid var(--border); }
+.btn.ghost:hover { color: var(--fg-dim); }
+.btn:disabled { opacity: 0.5; cursor: default; }
 
 /* explorer */
 #filter {
@@ -1755,11 +1073,27 @@ select.iconbtn { padding: 2px 4px; text-transform: none; letter-spacing: 0; }
 .node:hover { background: var(--bg-hover); }
 .node.active { background: var(--bg-active); }
 .node .tw { flex: 0 0 12px; color: var(--fg-faint); font-size: 10px; text-align: center; }
-.node .dot { flex: 0 0 6px; height: 6px; border-radius: 50%; background: var(--fg-faint); }
+.node .dot { flex: 0 0 6px; height: 6px; border-radius: 50%; background: transparent; }
 .node.dir { color: var(--fg); }
 .node .lbl { overflow: hidden; text-overflow: ellipsis; }
-.node .dim { color: var(--fg-faint); font-size: 11px; margin-left: 4px; }
 .kids.collapsed { display: none; }
+/* The dot carries one meaning: what git says about this file. An untouched file has no
+   dot at all, so a coloured one always means something happened. */
+.node.file.chg .dot, .tab .dot.chg { background: var(--git-mod); }
+.node.file.chg-new .dot, .tab .dot.chg-new { background: var(--git-new); }
+.node.file.chg-deleted .dot, .tab .dot.chg-deleted { background: var(--git-del); }
+.node.file.chg .lbl { color: #fff; }
+.node.file.chg-deleted .lbl { text-decoration: line-through; text-decoration-thickness: 1px; color: var(--fg-dim); }
+.node .num { margin-left: auto; padding-left: 8px; font-family: var(--mono); font-size: 9.5px; }
+.node .num .a { color: var(--green); }
+.node .num .r { color: var(--red); }
+/* A collapsed directory still has to say that something inside it moved. */
+.node.dir.chg > .lbl { color: #fff; }
+.node.dir.chg > .lbl::after { content: "\2022"; color: var(--git-mod); font-size: 14px; margin-left: 6px; vertical-align: middle; }
+/* Which files are part of the walk, and which ones you have written on. */
+.node .mk { flex: 0 0 auto; font-size: 9.5px; font-family: var(--mono); letter-spacing: 0; }
+.node .mk.stop { color: var(--them); }
+.node .mk.cmt { color: var(--me); }
 
 /* tabs */
 .tabs { flex: 0 0 35px; background: var(--bg-side); display: flex; align-items: stretch; overflow-x: auto; border-bottom: 1px solid var(--border-2); }
@@ -1769,6 +1103,8 @@ select.iconbtn { padding: 2px 4px; text-transform: none; letter-spacing: 0; }
   border-right: 1px solid var(--border-2); white-space: nowrap;
 }
 .tab.active { background: var(--bg-editor); color: var(--fg-dim); border-top: 1px solid var(--accent); }
+.tab .dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; background: transparent; }
+.tab .state { color: var(--hl-rail); font-size: 9px; letter-spacing: 0.06em; margin-left: 4px; }
 .tab .x { color: var(--fg-faint); font-size: 14px; line-height: 1; padding: 0 2px; border-radius: 2px; }
 .tab .x:hover { background: var(--bg-hover); color: var(--fg); }
 .subbar { flex: 0 0 26px; display: flex; align-items: center; border-bottom: 1px solid var(--border-2); }
@@ -1782,18 +1118,96 @@ select.iconbtn { padding: 2px 4px; text-transform: none; letter-spacing: 0; }
 .navbtn:hover:not(:disabled) { background: var(--bg-hover); border-color: var(--border); }
 .navbtn:disabled { color: #4a4a4a; cursor: default; }
 .navpos { font-size: 10.5px; color: var(--fg-faint); font-variant-numeric: tabular-nums; padding: 0 4px; min-width: 34px; text-align: center; }
-.chip.active { background: var(--hl-rail); color: #1e1e1e; border-color: var(--hl-rail); }
 
+/* code */
 #scroll { flex: 1 1 auto; overflow: auto; }
-#code { font-family: var(--mono); font-size: 13px; line-height: 19px; min-width: max-content; padding: 6px 0 40vh; }
-.ln { display: flex; border-left: 3px solid transparent; scroll-margin: 30vh; }
-.ln .no { flex: 0 0 62px; text-align: right; padding-right: 18px; color: var(--fg-faint); font-variant-numeric: tabular-nums; user-select: none; cursor: pointer; }
+#code { font-family: var(--mono); font-size: 13px; line-height: 19px; min-width: max-content; padding: 10px 0 40vh; }
+/* One uninterrupted column of code with evenly spaced line numbers. Nothing is allowed to
+   take vertical space between two lines except an actual annotation: the per-hunk controls
+   are lifted out of the flow and the state of a hunk is carried by the rail in its gutter,
+   so a diff reads top to bottom the way the file does. */
+.ln { display: flex; }
+#scroll:focus { outline: none; }
+#scroll:focus-visible { outline: none; }
+/* The gutter stays put when the code scrolls sideways, and keeps its own flat background
+   rather than the diff tint, so the numbers read as one straight column. */
+.ln .no {
+  flex: 0 0 var(--gutter); position: sticky; left: 0; z-index: 1;
+  background: var(--bg-editor); border-left: 3px solid transparent;
+  text-align: right; padding-right: 18px; color: var(--fg-faint);
+  font-variant-numeric: tabular-nums; user-select: none; cursor: pointer;
+}
 .ln:hover .no { color: var(--fg-dim); }
 .ln .src { white-space: pre; padding-right: 32px; }
-.ln.sel { background: var(--sel-bg); border-left-color: var(--accent); }
-.ln.hl { background: var(--hl-bg); border-left-color: var(--hl-rail); }
+.ln.sel { background: var(--sel-bg); }
+.ln.sel .no { border-left-color: var(--accent); }
+.ln.hl { background: var(--hl-bg); }
+.ln.hl .no { border-left-color: var(--hl-rail); }
 .ln.hl.sel { background: var(--sel-bg); }
-.empty { padding: 40px; color: var(--fg-faint); font-size: 13px; max-width: 46ch; line-height: 1.7; }
+/* A verdict shows as the rail beside the lines it was given on — no label, no row, and
+   visible however far sideways the code is scrolled. */
+.ln.v-ok .no { border-left-color: var(--ok); }
+.ln.v-no .no { border-left-color: var(--no); }
+/* Tinted background, untouched foreground: the code stays as legible as it is in the file
+   itself, and the tint is the only thing the diff adds. Changes you are not currently
+   deciding on are tinted far more weakly — present, but not competing for the decision. */
+.ln.del { background: var(--del-off); }
+.ln.add { background: var(--add-off); }
+.ln.cur.del { background: var(--del); }
+.ln.cur.add { background: var(--add); }
+.ln.cur.del .no, .ln.cur.add .no { color: var(--fg-dim); }
+.empty { padding: 40px; color: var(--fg-faint); font-size: 13px; max-width: 48ch; line-height: 1.7; }
+
+/* The bar that opens each hunk. The pane scrolls in BOTH directions, so the controls are
+   stuck to the left edge of the viewport and to the top of their own hunk, which is the
+   only way to promise they are on screen when they are wanted. */
+.hunk { position: relative; }
+/* Lifted clear of the text flow: it is one line tall, pinned beside the gutter, and it
+   costs the code no vertical space at all. It only appears while the pointer is on its own
+   hunk, because the keys are how this is normally done. */
+.hctl {
+  position: absolute; top: 0; left: 0; height: 19px; z-index: 4;
+  display: flex; align-items: center; pointer-events: none;
+}
+.hctl .grp {
+  position: sticky; left: var(--gutter); display: inline-flex; align-items: center; gap: 1px;
+  padding: 0 3px; margin-left: var(--gutter); pointer-events: none;
+  background: var(--bg-editor); border-radius: 2px;
+  opacity: 0; transition: opacity .12s;
+}
+.hunk:hover .hctl .grp { opacity: 1; pointer-events: auto; }
+/* The verdict pair, wherever a verdict can be given: two glyphs, no chrome. */
+.vb {
+  font: inherit; font-size: 11px; line-height: 1; border: 0; border-radius: 2px;
+  background: transparent; color: var(--fg-faint); padding: 1px 4px; cursor: pointer;
+}
+.vb.yes:hover, .vb.yes.on { color: var(--ok); }
+.vb.nope:hover, .vb.nope.on { color: var(--no); }
+.vb.cmt:hover { color: var(--me); }
+.vb.on { font-weight: 700; }
+
+/* the margin: what they said, what you said */
+.band {
+  font-family: var(--ui); font-size: 12.5px; line-height: 1.6; white-space: normal;
+  margin: 9px 0; padding: 5px 14px 7px 12px; border-left: 2px solid var(--border);
+  max-width: 88ch;
+}
+.band.them { background: var(--them-bg); border-left-color: var(--them); }
+.band.mine { background: var(--me-bg); border-left-color: var(--me); }
+.band .who { font-size: 9px; letter-spacing: 0.11em; text-transform: uppercase; color: var(--fg-faint); margin-bottom: 3px; display: flex; align-items: center; gap: 6px; }
+.band .who .vb, .band .who .act { opacity: 0; transition: opacity .12s; }
+.band:hover .who .vb, .band:hover .who .act, .band .who .vb.on { opacity: 1; }
+.band.them .who b { color: var(--them); font-weight: 600; }
+.band.mine .who b { color: var(--me); font-weight: 600; }
+.band .who .spacer { flex: 1; }
+.band .who .act { cursor: pointer; color: var(--fg-faint); text-transform: none; letter-spacing: 0; font-size: 10.5px; }
+.band .who .act:hover { color: #fff; }
+.band p { margin: 0 0 0.6em; }
+.band p:last-child { margin-bottom: 0; }
+.band code { font-family: var(--mono); font-size: 11.5px; background: #2d2d2d; padding: 1px 4px; border-radius: 2px; color: #ce9178; }
+.band textarea { width: 100%; max-width: 70ch; }
+.band .row { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
+.band .hint { font-size: 10.5px; color: var(--fg-faint); }
 
 /* pygments -> vs code dark+ */
 .k, .kc, .kd, .kr, .kt { color: #569cd6; }
@@ -1810,130 +1224,118 @@ select.iconbtn { padding: 2px 4px; text-transform: none; letter-spacing: 0; }
 .gd { color: #f44747; } .gi { color: #4ec9b0; } .gh, .gu { color: #569cd6; }
 .err { color: #f44747; }
 
-/* chat */
-#logwrap { flex: 1 1 auto; position: relative; min-height: 0; display: flex; }
-#log { flex: 1 1 auto; overflow-y: auto; padding: 14px 16px 6px; }
-#jumpDown {
-  position: absolute; top: 8px; left: 50%; transform: translateX(-50%); z-index: 5;
-  font: inherit; font-size: 11px; font-family: var(--ui); background: var(--btn); color: #fff;
-  border: 0; border-radius: 10px; padding: 3px 11px; cursor: pointer; opacity: 0.92;
-  box-shadow: 0 1px 6px rgba(0,0,0,0.45);
+/* the review pane */
+/* How much is left, where you cannot scroll away from it. Not knowing whether a review is
+   three items or thirty is the thing that makes one feel endless. */
+#progress {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 9px; padding: 2px 14px 9px;
+  border-bottom: 1px solid var(--border-2);
 }
-#jumpDown:hover { background: var(--btn-hover); opacity: 1; }
-.msg { margin-bottom: 18px; scroll-margin-top: 0; }
-/* Grows so the last exchange can still be pulled to the top of the viewport. */
-#tailpad { height: 0; }
-.msg.cell { transition: background .35s; border-radius: 2px; }
-.msg.cell.jumped { background: #2a2f38; }
-#cellPrev, #cellNext { font-size: 13px; line-height: 1; padding: 2px 6px; }
-.who { font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--fg-faint); margin-bottom: 5px; }
-.msg.me .who { color: #569cd6; }
-.who.titled { color: var(--fg-dim); font-size: 11px; letter-spacing: 0.04em; text-transform: none;
-              font-weight: 600; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
-.msg.me .body { background: #2d2d2d; border-left: 2px solid var(--accent); padding: 7px 10px; white-space: pre-wrap; color: var(--fg-dim); font-size: 12.5px; }
-.body { line-height: 1.65; }
-.body p { margin: 0 0 0.7em; }
-.body p:last-child { margin-bottom: 0; }
-.body code { font-family: var(--mono); font-size: 12px; background: #2d2d2d; padding: 1px 4px; border-radius: 2px; color: #ce9178; }
-.body strong { font-weight: 600; color: #fff; }
-.body em { font-style: italic; color: var(--fg); }
-.chip {
-  font-family: var(--mono); font-size: 11.5px; background: var(--chip-bg); color: var(--hl-rail);
-  border: 1px solid #5a4a20; border-radius: 2px; padding: 1px 5px; cursor: pointer; white-space: nowrap;
+#progress .bar {
+  flex: 1 1 auto; height: 4px; border-radius: 2px; background: #333; overflow: hidden;
+  display: flex;
 }
-.chip:hover { background: var(--hl-rail); color: #1e1e1e; }
-.acts { margin-bottom: 8px; display: flex; flex-direction: column; gap: 2px; }
-.act { font-family: var(--mono); font-size: 11px; color: var(--fg-faint); display: flex; gap: 6px; }
-.act::before { content: "\203A"; color: var(--green); }
-.act.replay { align-self: flex-start; cursor: pointer; background: none; border: 0; padding: 0;
-              color: var(--fg-faint); }
-.act.replay::before { content: none; }
-.act.replay:hover { color: var(--hl-rail); }
-.thinking { color: var(--fg-faint); font-style: italic; }
-.thinking::after { content: ""; animation: dots 1.4s steps(4, end) infinite; }
-@keyframes dots { 0% { content: ""; } 25% { content: "."; } 50% { content: ".."; } 75% { content: "..."; } }
-.errline { color: var(--red); font-size: 12px; margin-top: 6px; }
-.contbar { margin-top: 12px; display: flex; align-items: center; gap: 10px; }
-.contbtn {
-  font: inherit; font-size: 12px; font-family: var(--ui); background: var(--btn); color: #fff;
-  border: 0; border-radius: 2px; padding: 6px 12px; cursor: pointer;
-  display: inline-flex; align-items: center; gap: 8px;
+#progress .bar i { display: block; height: 100%; width: 0; transition: width .18s; }
+#progress .bar i.ok { background: var(--ok); }
+#progress .bar i.no { background: var(--no); }
+#progress .txt {
+  flex: 0 0 auto; font-family: var(--mono); font-size: 10.5px; color: var(--fg-faint);
+  white-space: nowrap;
 }
-.contbtn:hover:not(:disabled) { background: var(--btn-hover); }
-.contbtn:disabled { background: #2d2d2d; color: var(--fg-faint); cursor: default; }
-.contbtn .next { opacity: 0.75; font-style: italic; }
-.contbar .kbd { font-family: var(--mono); font-size: 10.5px; color: var(--fg-faint); }
-.notice { color: var(--fg-faint); font-size: 12px; font-style: italic; }
+#progress .txt b { color: var(--fg-dim); font-weight: 600; }
+#rbody { flex: 1 1 auto; overflow-y: auto; padding: 12px 14px 20px; }
+#brief { font-size: 12.5px; line-height: 1.65; color: var(--fg-dim); padding-bottom: 12px; margin-bottom: 12px; border-bottom: 1px solid var(--border); }
+#brief p { margin: 0 0 0.7em; }
+#brief p:last-child { margin-bottom: 0; }
+#brief code { font-family: var(--mono); font-size: 11.5px; background: #2d2d2d; padding: 1px 4px; border-radius: 2px; color: #ce9178; }
+#brief .probs { color: var(--hl-rail); font-size: 11.5px; margin-top: 8px; }
+.sect { font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--fg-faint); margin: 18px 0 8px; }
+.sect:first-child { margin-top: 2px; }
+/* One row per thing to review. Dense on purpose: this pane answers "where am I and what is
+   left", and it can only do that if the whole walk fits on a screen. */
+.wrow {
+  display: flex; align-items: baseline; gap: 7px; cursor: pointer;
+  padding: 3px 6px 3px 4px; border-left: 2px solid transparent; border-radius: 2px;
+}
+.wrow:hover { background: var(--bg-hover); }
+.wrow.on { background: var(--bg-active); border-left-color: var(--hl-rail); }
+.wrow.on .k { color: var(--hl-rail); }
+.wrow .k {
+  flex: 0 0 15px; font-family: var(--mono); font-size: 11px; color: var(--fg-faint);
+  text-align: right;
+}
+.wrow .t { font-size: 12.5px; color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wrow.on .t { color: #fff; font-weight: 600; }
+.wrow .a { margin-left: auto; font-family: var(--mono); font-size: 10.5px; color: var(--fg-faint); white-space: nowrap; }
+.wrow .c { font-size: 9px; color: var(--me); }
+.wrow.ok .k { color: var(--ok); }
+.wrow.no .k { color: var(--no); }
+.wrow.ok .t { color: var(--fg-faint); }
+.wrow.no .t { color: var(--no); }
+.wrow.gone .t { color: var(--red); text-decoration: line-through; }
+.cmt {
+  border-left: 2px solid var(--me); background: var(--me-bg); padding: 5px 9px; margin-bottom: 5px;
+  font-size: 12px; line-height: 1.5; white-space: pre-wrap; color: var(--fg-dim);
+}
+.cmt .where { display: block; font-family: var(--mono); font-size: 10.5px; color: var(--me); margin-bottom: 2px; cursor: pointer; white-space: nowrap; }
+.cmt .where:hover { color: #fff; }
+.cmt .x { float: right; cursor: pointer; color: var(--fg-faint); padding: 0 2px; }
+.cmt .x:hover { color: #fff; }
+.dimnote { font-size: 11.5px; color: var(--fg-faint); line-height: 1.6; }
 
-.snip {
-  font-family: var(--mono); font-size: 12px; line-height: 1.5; margin: 9px 0; padding: 8px 10px;
-  background: var(--bg-editor); border: 1px solid var(--border); border-left: 2px solid #6a9955;
-  border-radius: 2px; overflow-x: auto; white-space: pre; color: var(--fg-dim);
+#rfoot { flex: 0 0 auto; border-top: 1px solid var(--border-2); padding: 10px 14px 12px; display: flex; flex-direction: column; gap: 8px; }
+textarea {
+  resize: none; font-family: var(--ui); font-size: 12.5px; color: var(--fg-dim);
+  background: var(--bg-input); border: 1px solid var(--border); border-radius: 2px;
+  padding: 7px 9px; line-height: 1.5;
 }
-.snip.live { opacity: 0.75; }
-.diff { border: 1px solid var(--border); background: var(--bg-editor); margin: 10px 0; }
-.diff .head { display: flex; align-items: center; gap: 8px; padding: 5px 10px; background: var(--bg-side); border-bottom: 1px solid var(--border); font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--fg-faint); }
-.diff .head .spacer { flex: 1; }
-.diff pre { margin: 0; font-family: var(--mono); font-size: 12px; line-height: 18px; overflow-x: auto; padding: 6px 0; }
-.diff .d { padding: 0 10px; white-space: pre; }
-.diff .d.minus { background: var(--del); color: #d4a0a0; }
-.diff .d.plus { background: var(--add); color: #b7e0d5; }
-.btn { font: inherit; font-size: 11px; background: var(--btn); color: #fff; border: 0; border-radius: 2px; padding: 3px 10px; cursor: pointer; }
-.btn:hover:not(:disabled) { background: var(--btn-hover); }
-.btn.ghost { background: transparent; color: var(--fg-faint); border: 1px solid var(--border); }
-.btn.ghost:hover { color: var(--fg-dim); }
-.btn:disabled { opacity: 0.5; cursor: default; }
+textarea:focus { outline: none; border-color: var(--accent); }
+#general { width: 100%; min-height: 34px; max-height: 140px; }
+#rfoot .row { display: flex; gap: 10px; align-items: center; }
+#count { font-size: 11.5px; color: var(--fg-faint); }
+#count b { color: var(--me); font-weight: 600; }
+#count .y { color: var(--ok); font-weight: 600; }
+#count .n { color: var(--no); font-weight: 600; }
+#tally { font-family: var(--mono); font-size: 11px; letter-spacing: 0; }
+#tally .y { color: var(--ok); } #tally .n { color: var(--no); }
 
-#composer { flex: 0 0 auto; border-top: 1px solid var(--border-2); padding: 10px 14px 12px; display: flex; flex-direction: column; gap: 8px; }
-#ctx { font-family: var(--mono); font-size: 11.5px; color: #9cdcfe; display: flex; gap: 8px; align-items: center; }
-.refbar { display: flex; flex-wrap: wrap; gap: 5px; }
-.ref {
-  display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 11.5px;
-  background: #1e3a5f; color: #9cdcfe; border: 1px solid #2d5a8c; border-radius: 2px;
-  padding: 2px 4px 2px 7px; max-width: 100%;
-}
-.ref.reject { background: #3a1e38; color: var(--rej-fg); border-color: #6b3a67; }
-.ref.reject .x { color: #a06a9c; }
-.ref.reject .x:hover { background: #6b3a67; }
-.ref .lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
-.ref .lbl:hover { color: #cfe8ff; }
-.ref .x { cursor: pointer; color: #6f9dc9; padding: 0 2px; border-radius: 2px; font-size: 13px; line-height: 1; }
-.ref .x:hover { background: #2d5a8c; color: #fff; }
-.msg.me .refbar { margin-bottom: 6px; }
-.msg.me .ref { cursor: pointer; }
 #addSel {
   position: fixed; z-index: 50; font: inherit; font-size: 11px; font-family: var(--ui);
-  background: var(--btn); color: #fff; border: 1px solid #1177bb; border-radius: 3px;
+  background: var(--me); color: #1e1e1e; border: 0; border-radius: 3px;
   padding: 3px 9px; cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,0.5); white-space: nowrap;
 }
-#addSel:hover { background: var(--btn-hover); }
-#addSel kbd { font-family: var(--mono); font-size: 10px; opacity: 0.7; margin-left: 5px; }
-#ctx button { font: inherit; background: none; border: 0; color: var(--fg-faint); cursor: pointer; text-decoration: underline; padding: 0; }
-.row { display: flex; gap: 8px; align-items: flex-end; }
-textarea { flex: 1; resize: none; font-family: var(--ui); font-size: 13px; color: var(--fg-dim); background: var(--bg-input); border: 1px solid var(--border); border-radius: 2px; padding: 7px 9px; min-height: 32px; max-height: 160px; line-height: 1.5; }
-textarea:focus { outline: none; border-color: var(--accent); }
+#addSel kbd { font-family: var(--mono); font-size: 10px; opacity: 0.65; margin-left: 5px; }
 
 .status { flex: 0 0 22px; background: var(--accent); color: #fff; display: flex; align-items: center; gap: 16px; padding: 0 12px; font-size: 11.5px; user-select: none; }
 .status .spacer { flex: 1; }
-.status.busy { background: var(--purple); }
+/* The keys, where you cannot miss them. A shortcut nobody knows about is not a shortcut. */
+.status .legend { font-family: var(--mono); font-size: 10.5px; opacity: 0.85; letter-spacing: 0; }
+.status .legend b { font-weight: 700; opacity: 1; }
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; } }
 </style>
 </head>
 <body>
 
 <div class="titlebar">
+  <button id="back" hidden title="Back to the queue (Esc)">&#8592;</button>
   <span class="brand">codewalk</span>
-  <span class="center" id="titleRoot">—</span>
-  <span id="syncbar" hidden><button id="syncNow">Sync to terminal</button><button id="syncClose" class="ghost">Sync &amp; close</button></span>
-  <button id="handback" hidden>Return to terminal</button>
+  <span class="center" id="titleRoot">dashboard</span>
+  <span class="base" id="titleBase"></span>
 </div>
 
-<div class="main">
+<div id="home">
+  <div class="hwrap">
+    <div id="qnote" hidden></div>
+    <div id="qlist"></div>
+    <div id="qempty" class="qnone">nothing pending</div>
+  </div>
+</div>
+
+<div class="main" id="work" hidden>
   <section class="pane" id="explorer">
-    <div class="paneHead"><span id="expName">Explorer</span><span class="spacer"></span><span class="dim" id="fileCount" style="text-transform:none;letter-spacing:0"></span></div>
+    <div class="paneHead"><span id="expName">Explorer</span><span class="spacer"></span><span id="fileCount" style="text-transform:none;letter-spacing:0;color:var(--fg-faint)"></span></div>
     <input id="filter" type="search" placeholder="Filter files…" aria-label="Filter files">
     <div id="tree"></div>
-    <button id="allGood" hidden>Finalize Changes</button>
   </section>
 
   <div class="sash" id="sash1" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize explorer"></div>
@@ -1948,36 +1350,45 @@ textarea:focus { outline: none; border-color: var(--accent); }
         <button class="navbtn" id="navFwd" title="Forward (Alt+Right)" disabled>&#8594;</button>
       </div>
     </div>
-    <div id="scroll"><div id="code"></div>
-      <div class="empty" id="empty">No file open. Pick one from the tree — or just ask a question on the right, and I will open whatever I need as I explain it.</div>
+    <div id="scroll" tabindex="0"><div id="code"></div>
+      <div class="empty" id="empty">Nothing open yet.</div>
     </div>
   </section>
 
-  <div class="sash" id="sash2" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize chat"></div>
+  <div class="sash" id="sash2" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize review"></div>
 
-  <section class="pane" id="chat">
-    <div class="paneHead"><span class="spacer"></span><select class="iconbtn" id="model" title="Which model answers. Takes effect on the next question; the conversation so far is kept."></select><button class="iconbtn" id="voice" title="Read the answers aloud and move the editor in time with the voice">Voice: off</button><span class="rateWrap" id="rateWrap" hidden title="Speaking speed — drag, or Alt+, / Alt+. "><input type="range" id="rate" min="0.5" max="2" step="0.25" value="1" aria-label="Speaking speed"><span id="rateVal">1×</span></span><button class="iconbtn" id="follow" title="Let Claude move the editor as it explains">Follow: on</button><button class="iconbtn" id="clearHl" disabled>Clear highlight</button><button class="iconbtn" id="cellPrev" title="Previous step (Alt+Up)" disabled>&#8593;</button><button class="iconbtn" id="cellNext" title="Next step (Alt+Down)" disabled>&#8595;</button></div>
-    <div id="logwrap">
-      <button id="jumpDown" hidden title="Jump to the latest step">&#8595; latest</button>
-      <div id="log"><div id="tailpad"></div></div>
+  <section class="pane" id="review">
+    <div class="paneHead">
+      <span>Review</span><span class="spacer"></span>
+      <span id="tally"></span>
+      <span class="navpos" id="stopPos"></span>
+      <button class="iconbtn" id="stopPrev" title="Previous stop (Alt+Up)" disabled>&#8593;</button>
+      <button class="iconbtn" id="stopNext" title="Next stop (Alt+Down)" disabled>&#8595;</button>
     </div>
-    <div id="composer">
-      <div id="ctx" hidden></div>
-      <div class="refbar" id="refs" hidden></div>
+    <div id="progress"><div class="bar"><i class="ok"></i><i class="no"></i></div><span class="txt"></span></div>
+    <div id="rbody">
+      <div id="brief"></div>
+      <div id="stops"></div>
+      <div id="loose"></div>
+    </div>
+    <div id="rfoot">
+      <textarea id="general" rows="1" placeholder="Anything that is not about one place in the code… (Enter sends, Shift+Enter for a line)" aria-label="General comment"></textarea>
       <div class="row">
-        <textarea id="box" rows="1" placeholder="Ask about this codebase…" aria-label="Message"></textarea>
-        <button class="btn" id="send">Send</button>
+        <button class="btn" id="send">Send review</button>
+        <span id="count">no comments yet</span>
       </div>
     </div>
   </section>
 </div>
 
-<button id="addSel" hidden>Add to chat<kbd>Ctrl L</kbd></button>
+<button id="addSel" hidden>Comment<kbd>Ctrl L</kbd></button>
 
 <div class="status" id="status">
   <span id="stFile">no file</span>
+  <span id="stPos"></span>
   <span id="stSel"></span>
   <span class="spacer"></span>
+  <span class="legend"><b>a</b>/<b>k</b> approve &nbsp;<b>r</b> reject &nbsp;<b>c</b> comment &nbsp;<b>n</b>/<b>p</b> next/prev &nbsp;<b>u</b> undo</span>
   <span id="stState">ready</span>
 </div>
 
@@ -1985,10 +1396,21 @@ textarea:focus { outline: none; border-color: var(--accent); }
 (function () {
   "use strict";
   const $ = (id) => document.getElementById(id);
-  const codeEl = $("code"), logEl = $("log"), boxEl = $("box"), sendEl = $("send");
+  const codeEl = $("code");
+  const CHG = "Δ ";          // tab-key prefix: the diff view of a path, not the file
 
-  let allFiles = [], openTabs = [], active = null, busy = false, watchToken = 0;
+  const STAMP = "__STAMP__";            // which build of this page is in the tab
+  let rid = null;                       // the review on screen, if any
+  const R = (tail) => "/api/r/" + rid + (tail ? "/" + tail : "");
 
+  let allFiles = [], openTabs = [], active = null;
+  let chgItems = [], chgByPath = new Map(), chgBase = "";
+  let stops = [], curStop = -1;
+  let comments = [], nextId = 1;
+  // key -> {key, state, path, a, b, stop, title, rows}. A verdict answers the question
+  // "is this right", which is not the question a comment answers, so it is held apart.
+  const verdicts = new Map();
+  let editing = null;             // {path, rowA, rowB, stop} while a comment box is open
 
   // ---------------- tree ----------------
   const expanded = new Set([""]);
@@ -2009,8 +1431,8 @@ textarea:focus { outline: none; border-color: var(--accent); }
 
   // The tree is `git ls-files` plus whatever the changes list knows that it does not.
   // A deleted file is gone from disk so git cannot report it at all; a newly written one
-  // is real but was not there when the list was last fetched. Both would otherwise be
-  // invisible — and they are the two states you most need to see.
+  // may not have been there when the list was built. Both would otherwise be invisible —
+  // and they are the two states you most need to see.
   function treeFiles() {
     const seen = new Set(allFiles);
     const extra = chgItems.map((e) => e.path).filter((p) => !seen.has(p));
@@ -2067,13 +1489,12 @@ textarea:focus { outline: none; border-color: var(--accent); }
   }
 
   function fileNode(path, label, depth) {
-    const ch = chgAt(path);
+    const ch = chgByPath.get(path) || null;
     const row = document.createElement("div");
     row.className = "node file"
       + (active === path || active === CHG + path ? " active" : "")
       + (ch ? " chg chg-" + ch.state : "");
     row.style.paddingLeft = 8 + depth * 12 + "px";
-    row.dataset.path = path;
     const tw = document.createElement("span");
     tw.className = "tw";
     const dot = document.createElement("span");
@@ -2082,6 +1503,16 @@ textarea:focus { outline: none; border-color: var(--accent); }
     lbl.className = "lbl";
     lbl.textContent = label;
     row.append(tw, dot, lbl);
+    const nStop = stops.filter((s) => s.path === path).length;
+    const nCmt = comments.filter((c) => c.path === path).length;
+    if (nStop || nCmt) {
+      const mk = document.createElement("span");
+      mk.className = "mk " + (nCmt ? "cmt" : "stop");
+      mk.textContent = nCmt ? "●" + (nCmt > 1 ? nCmt : "") : "○";
+      mk.title = (nStop ? nStop + " stop(s)" : "") + (nStop && nCmt ? ", " : "")
+               + (nCmt ? nCmt + " comment(s) of yours" : "");
+      row.appendChild(mk);
+    }
     if (ch && !ch.binary) {
       const n = document.createElement("span");
       n.className = "num";
@@ -2089,16 +1520,13 @@ textarea:focus { outline: none; border-color: var(--accent); }
       const r = document.createElement("span"); r.className = "r"; r.textContent = " -" + ch.removed;
       n.append(a, r);
       row.appendChild(n);
-      row.title = ch.state + " \u00b7 open the diff";
+      row.title = ch.state + " · open the diff";
     }
     // A changed file opens as its diff. The plain file is still one click away on the tab.
     row.onclick = () => openFile(ch ? CHG + path : path);
     return row;
   }
 
-  // Rebuilt whenever the changes list is refetched; the tree reads it on every render.
-  let chgByPath = new Map();
-  function chgAt(path) { return chgByPath.get(path) || null; }
   function chgUnder(dir) {
     const pre = dir + "/";
     for (const p of chgByPath.keys()) if (p.startsWith(pre)) return true;
@@ -2110,9 +1538,14 @@ textarea:focus { outline: none; border-color: var(--accent); }
     for (let i = 1; i < parts.length; i++) expanded.add(parts.slice(0, i).join("/"));
   }
 
+  function realPath(p) { return p.startsWith(CHG) ? p.slice(CHG.length) : p; }
+  function viewFor(p) { return chgByPath.has(p) ? CHG + p : p; }
+  function shortPath(p) {
+    const b = p.split("/");
+    return b.length <= 2 ? p : ".../" + b.slice(-2).join("/");
+  }
+
   // ---------------- navigation history ----------------
-  // Every place the editor is sent — a tree click, a tab, one of Claude's chips — is an
-  // entry here, so the arrows replay the visit the way browser history replays a session.
   let hist = [], hIdx = -1, navLock = false;
   const HIST_MAX = 200;
 
@@ -2144,11 +1577,6 @@ textarea:focus { outline: none; border-color: var(--accent); }
 
   $("navBack").onclick = () => navGo(-1);
   $("navFwd").onclick = () => navGo(1);
-  document.addEventListener("keydown", (e) => {
-    if (!e.altKey || e.ctrlKey || e.metaKey) return;
-    if (e.key === "ArrowLeft") { e.preventDefault(); navGo(-1); }
-    if (e.key === "ArrowRight") { e.preventDefault(); navGo(1); }
-  });
   window.addEventListener("mouseup", (e) => {
     if (e.button === 3) { e.preventDefault(); navGo(-1); }
     if (e.button === 4) { e.preventDefault(); navGo(1); }
@@ -2157,17 +1585,21 @@ textarea:focus { outline: none; border-color: var(--accent); }
   // ---------------- tabs + file ----------------
   function tab(path) { return openTabs.find((t) => t.path === path); }
 
-  async function openFile(path, spec, focus) {
+  async function openFile(path, spec) {
     let t = tab(path);
-    // A changed file is a git-side view, not a tree entry: it may not exist on disk at all
-    // (a deletion), and there is nothing to watch for local edits.
     const isChg = path.startsWith(CHG);
     if (!t) {
-      const rel = isChg ? path.slice(CHG.length) : path;
-      const url = (isChg ? "/api/change?path=" : "/api/file?path=") + encodeURIComponent(rel);
-      const data = await fetch(url).then((r) => r.json());
-      if (data.error) { flash(data.error); return null; }
-      t = { path: path, data: data, hl: new Set(), sel: null, scroll: 0, chg: isChg };
+      const rel = realPath(path);
+      let data = isChg ? diffCache.get(rel) : null;
+      if (!data) {
+        const url = R(isChg ? "change" : "file") + "?path=" + encodeURIComponent(rel);
+        try { data = await fetch(url).then((r) => r.json()); }
+        catch (e) { flash("Could not reach the server."); return null; }
+        if (data.error) { flash(data.error); return null; }
+        if (isChg) diffCache.set(rel, data);
+      }
+      t = { path: path, rel: rel, data: data, hl: new Set(), sel: null, scroll: 0, chg: isChg,
+            rows: lineRows(data) };
       openTabs.push(t);
     }
     if (active && active !== path) {
@@ -2175,18 +1607,11 @@ textarea:focus { outline: none; border-color: var(--accent); }
       if (prev) prev.scroll = $("scroll").scrollTop;
     }
     active = path;
-    if (spec) { t.hl = parseSpec(spec); }
-    if (!isChg) {
-      expandTo(path);
-      renderTree();
-    }
+    t.hl = spec ? parseSpec(spec) : t.hl;
+    expandTo(realPath(path));
     renderTabs();
-    // A changed file opens ON its first change. That is the whole point of the list:
-    // clicking a row should land the eye on the edit, not at line 1 of a long file.
-    // A proposal opens on its hunk for the same reason a changed file does.
+    renderTree();
     renderCode(t, !!spec);
-    if (!isChg) watchFile(t);
-    if (chgItems.length) renderTree();
     pushHist(path, spec);
     return t;
   }
@@ -2198,8 +1623,11 @@ textarea:focus { outline: none; border-color: var(--accent); }
     if (active === path) {
       const next = openTabs[Math.min(i, openTabs.length - 1)];
       active = next ? next.path : null;
-      if (next) { renderCode(next, false); watchFile(next); }
-      else { codeEl.textContent = ""; $("empty").hidden = false; $("stFile").textContent = "no file"; $("crumbs").textContent = ""; }
+      if (next) renderCode(next, false);
+      else {
+        codeEl.textContent = ""; $("empty").hidden = false;
+        $("stFile").textContent = "no file"; $("crumbs").textContent = "";
+      }
     }
     renderTabs(); renderTree();
   }
@@ -2210,10 +1638,9 @@ textarea:focus { outline: none; border-color: var(--accent); }
     for (const t of openTabs) {
       const d = document.createElement("div");
       d.className = "tab" + (t.path === active ? " active" : "");
+      const st = chgByPath.get(t.rel);
       const dot = document.createElement("span");
-      const st = chgAt(realPath(t.path));
       dot.className = "dot" + (st ? " chg chg-" + st.state : "");
-      dot.style.width = "6px"; dot.style.height = "6px"; dot.style.borderRadius = "50%"; dot.style.display = "inline-block";
       const n = document.createElement("span");
       n.textContent = t.data.name;
       if (t.chg) {
@@ -2231,33 +1658,93 @@ textarea:focus { outline: none; border-color: var(--accent); }
     }
   }
 
+  // file line number -> row index. In a diff view the gutter numbers the file as it is
+  // now, so a line number in a note or a comment is a line number in the file and needs
+  // no translation; this is only the lookup back to the row that carries it.
+  function lineRows(data) {
+    const m = new Map();
+    const nums = data.nums;
+    for (let i = 0; i < data.lines.length; i++) {
+      const key = nums ? nums[i] : String(i + 1);
+      if (key && key !== "−" && !m.has(key)) m.set(key, i);
+    }
+    return m;
+  }
+
+  function rowOf(t, line) {
+    const r = t.rows.get(String(line));
+    return r === undefined ? -1 : r;
+  }
+
+  // Everything that wants to sit in the margin of this file, by the row it attaches to.
+  // Where a note sits: immediately above the lines it is about.
+  //
+  // One subtlety earns the whole function. An anchor is a line number, and the removed lines
+  // of a hunk have no numbers — they come first, marked with a dash. So a stop that begins
+  // at a hunk's first *arriving* line would have its note slipped between the lines that went
+  // and the lines that came, inside the change it was explaining. When that is the case the
+  // note moves up over the removed lines too, so it sits above the whole change. A stop
+  // pointing into the middle of a long hunk is left exactly where it points.
+  function bandsFor(t) {
+    const rh = rowHunks(t);
+    const by = new Map();
+    const put = (row, el) => {
+      if (!by.has(row)) by.set(row, []);
+      by.get(row).push(el);
+    };
+    const place = (row) => {
+      if (row < 0 || row === undefined) return -1;
+      const h = rh ? rh[row] : null;
+      if (h && row === h.at + h.removed) return h.at;   // first arriving line of the hunk
+      return row;
+    };
+    for (const s of stops) {
+      if (s.path !== t.rel || s.missing) continue;
+      put(place(s.a ? rowOf(t, s.a) : 0), stopBand(s));
+    }
+    for (const c of comments) {
+      if (c.path !== t.rel) continue;
+      put(place(c.rowA >= 0 && t.data === c.data ? c.rowA : rowOf(t, c.a)), cmtBand(c));
+    }
+    return by;
+  }
+
   function renderCode(t, scrollToHl) {
+    flushEdit();
+    const curKey = (walk()[walkIdx] || {}).key || "";
     $("empty").hidden = true;
     codeEl.textContent = "";
     const frag = document.createDocumentFragment();
-    const rh = t.data.hunks ? rowHunks(t) : null;
-    // Rows of a hunk go inside a box of their own. A sticky bar is held by its parent, so
-    // the box is what makes the bar ride along at the top of the pane for exactly as long
-    // as its hunk is in view, and no longer.
+    const rh = rowHunks(t);
+    const bands = bandsFor(t);
+    const keys = rowKeys(t);
+    // Rows of a hunk go inside a box of their own, which is what the absolutely positioned
+    // controls are measured against. The box adds no spacing of its own, so the column of
+    // code runs through it unbroken.
     let into = frag;
+    for (const el of (bands.get(-1) || [])) frag.appendChild(el);
     t.data.lines.forEach((segs, i) => {
       const n = i + 1;
-      // The gutter numbers the file as it would be after the change; a removed line shows
-      // a dash. dataset.n stays the array index so selection, Ctrl-L and the scroll below
-      // keep working on what is actually displayed.
       const mark = t.data.marks ? t.data.marks[i] : "";
       const h = rh ? rh[i] : null;
-      const st = h ? (review.get(h.id) || "") : "";
       if (h && h.at === i) {
         into = document.createElement("div");
         into.className = "hunk";
-        into.appendChild(hunkBar(t, h));
+        into.appendChild(hunkCtl(t, h));
         frag.appendChild(into);
       }
+      if (bands.has(i)) for (const el of bands.get(i)) into.appendChild(el);
+      // The rail says what was decided about the whole change; the lit tint says which part
+      // of it you are deciding on now. They are different questions and different keys.
+      const hv = h ? verdictOf(hunkTarget(t, h).key) : "";
+      const hkey = keys[i] || "";
       const row = document.createElement("div");
-      row.className = "ln" + (mark ? " " + mark : "") + (st ? " rv-" + st : "")
+      row.className = "ln" + (mark ? " " + mark : "")
+        + (hv === "approve" ? " v-ok" : hv === "reject" ? " v-no" : "")
+        + (hkey && hkey === curKey ? " cur" : "")
         + (t.hl.has(n) ? " hl" : "") + (t.sel && n >= t.sel.a && n <= t.sel.b ? " sel" : "");
       row.dataset.n = String(n);
+      if (hkey) row.dataset.key = hkey;
       const no = document.createElement("span");
       no.className = "no";
       no.textContent = t.data.nums ? t.data.nums[i] : String(n);
@@ -2278,26 +1765,86 @@ textarea:focus { outline: none; border-color: var(--accent); }
     document.title = t.data.name + " — codewalk";
     const cr = $("crumbs");
     cr.textContent = "";
-    t.path.split("/").forEach((part, i, arr) => {
+    realPath(t.path).split("/").forEach((part, i, arr) => {
       const s = document.createElement("span");
       s.textContent = part;
       cr.appendChild(s);
-      if (i < arr.length - 1) { const g = document.createElement("span"); g.textContent = " › "; g.style.color = "var(--border)"; cr.appendChild(g); }
+      if (i < arr.length - 1) {
+        const g = document.createElement("span");
+        g.textContent = " ›"; g.style.color = "var(--border)";
+        cr.appendChild(g);
+      }
     });
-    $("clearHl").disabled = !t.hl.size;
     paintSel();
 
-    // A diff view aims at its first hunk. Landing at line 1 of a long file and making the
-    // reader hunt is the thing this list exists to prevent.
-    if (!scrollToHl && t.data.hunks && t.data.hunks.length) {
-      const bar = codeEl.querySelector(".hbar");
-      if (bar) bar.scrollIntoView({ block: "center" });
-    } else if (scrollToHl && t.hl.size) {
-      const first = codeEl.querySelector('.ln[data-n="' + Math.min.apply(null, Array.from(t.hl)) + '"]');
-      if (first) first.scrollIntoView({ block: "center", behavior: "smooth" });
-    } else {
-      $("scroll").scrollTop = t.scroll || 0;
+    if (scrollToHl && t.hl.size) {
+      revealTop(codeEl.querySelector('.ln[data-n="'
+        + Math.min.apply(null, Array.from(t.hl)) + '"]'));
+    } else if (t.scroll) {
+      $("scroll").scrollTop = t.scroll;
+    } else if (t.data.hunks && t.data.hunks.length) {
+      // A diff view aims at its first hunk. Landing at line 1 of a long file and making
+      // the reader hunt is the thing this view exists to prevent.
+      revealTop(codeEl.querySelector(".hunk"));
     }
+  }
+
+  // The TOP of the viewport, not the middle. The first line of a change is where reading
+  // starts; everything above it belongs to the change before. If a note sits above the line,
+  // that is the real top of the thing being shown, so it goes there instead — and a row
+  // inside a hunk is pushed clear of the sticky bar that would otherwise cover it.
+  // Scrolling the pane ourselves must not be mistaken for you scrolling it; without this
+  // the jump to an item immediately re-asked the viewport where it was and talked itself
+  // into a different answer.
+  let scrollLock = 0;
+
+  // How much of the code above a change comes with it. Landing a change flush against the
+  // top edge says nothing about where in the file it sits, and the surrounding lines are
+  // most of what tells you whether a change belongs where it is.
+  const LEAD_LINES = 4;
+
+  function lead() {
+    const line = codeEl.querySelector(".ln");
+    const h = line ? line.getBoundingClientRect().height : 19;
+    return Math.round(h * LEAD_LINES) + 4;
+  }
+
+  function revealTop(el) {
+    if (!el) return;
+    scrollLock = Date.now();
+    const sc = $("scroll");
+    // If a note was placed above these lines, it is part of what you came to read.
+    const prev = el.previousElementSibling;
+    const target = (prev && prev.classList.contains("band")) ? prev : el;
+    sc.scrollTop += target.getBoundingClientRect().top - sc.getBoundingClientRect().top - lead();
+  }
+
+  function rowHunks(t) {
+    if (!t.data.hunks) return null;
+    const out = new Array(t.data.lines.length).fill(null);
+    for (const h of t.data.hunks) {
+      for (let i = h.at; i < h.at + h.rows && i < out.length; i++) out[i] = h;
+    }
+    return out;
+  }
+
+  // Three glyphs beside the first line of a hunk, and nothing else. The count that used to
+  // be here is in the review pane, where it does not cost a row of code.
+  function hunkCtl(t, h) {
+    const target = hunkTarget(t, h);
+    const wrap = document.createElement("div");
+    wrap.className = "hctl";
+    const grp = document.createElement("span");
+    grp.className = "grp";
+    const b = document.createElement("button");
+    b.className = "vb cmt";
+    b.textContent = "\u270e";
+    b.title = "comment on this change (c)";
+    b.onclick = () => startComment(t, h.at, h.at + h.rows - 1, target.stop, null,
+                                   target.stop ? null : target.key);
+    grp.append(verdictBtns(target, t, "vb"), b);
+    wrap.appendChild(grp);
+    return wrap;
   }
 
   function parseSpec(spec) {
@@ -2311,26 +1858,504 @@ textarea:focus { outline: none; border-color: var(--accent); }
     return out;
   }
 
-  let follow = true;
-  const followBtn = $("follow");
-  followBtn.onclick = () => {
-    follow = !follow;
-    followBtn.textContent = "Follow: " + (follow ? "on" : "off");
-    followBtn.style.color = follow ? "var(--hl-rail)" : "";
-  };
-  followBtn.style.color = "var(--hl-rail)";
+  function prose(el, text) {
+    for (const para of String(text).split(/\n\s*\n/)) {
+      if (!para.trim()) continue;
+      const p = document.createElement("p");
+      para.trim().split(/`([^`]+)`/).forEach((s, i) => {
+        if (i % 2) { const c = document.createElement("code"); c.textContent = s; p.appendChild(c); }
+        else if (s) p.appendChild(document.createTextNode(s));
+      });
+      el.appendChild(p);
+    }
+  }
 
-  $("clearHl").onclick = () => {
-    const t = tab(active);
+  // ---------------- the margin ----------------
+  function stopBand(s) {
+    const el = document.createElement("div");
+    el.className = "band them";
+    const who = document.createElement("div");
+    who.className = "who";
+    const b = document.createElement("b");
+    b.textContent = "stop " + s.n + (s.title ? " · " + s.title : "");
+    who.appendChild(b);
+    const sp = document.createElement("span"); sp.className = "spacer"; who.appendChild(sp);
+    who.appendChild(verdictBtns(stopTarget(s), null, "vb"));
+    const act = document.createElement("span");
+    act.className = "act"; act.textContent = "comment";
+    act.onclick = () => commentOnStop(s);
+    who.appendChild(act);
+    el.appendChild(who);
+    if (s.note) prose(el, s.note);
+    return el;
+  }
+
+  function cmtBand(c) {
+    const el = document.createElement("div");
+    el.className = "band mine";
+    const who = document.createElement("div");
+    who.className = "who";
+    const b = document.createElement("b");
+    b.textContent = "you" + (c.stop ? " · on stop " + c.stop : "");
+    who.appendChild(b);
+    const sp = document.createElement("span"); sp.className = "spacer"; who.appendChild(sp);
+    const ed = document.createElement("span");
+    ed.className = "act"; ed.textContent = "edit";
+    ed.onclick = () => editComment(c);
+    const rm = document.createElement("span");
+    rm.className = "act"; rm.textContent = "×";
+    rm.onclick = () => dropComment(c.id);
+    who.append(ed, rm);
+    el.appendChild(who);
+    const p = document.createElement("p");
+    p.style.whiteSpace = "pre-wrap";
+    p.textContent = c.note;
+    el.appendChild(p);
+    return el;
+  }
+
+  // ---------------- writing a comment ----------------
+  // The box opens on the code, not in a side panel: what you are looking at when you have
+  // something to say is the line, so that is where the cursor goes.
+  function startComment(t, rowA, rowB, stopN, existing, keyArg, ask) {
+    cancelEdit();
+    const anchor = codeEl.querySelector('.ln[data-n="' + (rowB + 1) + '"]');
+    if (!anchor) return;
+    const box = document.createElement("div");
+    box.className = "band mine";
+    const who = document.createElement("div");
+    who.className = "who";
+    const b = document.createElement("b");
+    const at = anchorOf(t, rowA, rowB);
+    b.textContent = (existing ? "edit · " : "you · ") + shortPath(t.rel)
+                  + ":" + (at.a === at.b ? at.a : at.a + "-" + at.b)
+                  + (stopN ? "  (stop " + stopN + ")" : "");
+    who.appendChild(b);
+    box.appendChild(who);
+    const ta = document.createElement("textarea");
+    ta.rows = 3;
+    ta.placeholder = ask || "What about these lines?";
+    if (existing) ta.value = existing.note;
+    const row = document.createElement("div");
+    row.className = "row";
+    const save = document.createElement("button");
+    save.className = "btn";
+    save.textContent = existing ? "Save"
+      : (verdictOf(keyArg || (stopN ? "stop:" + stopN : "")) === "reject"
+         ? "Add comment" : "Reject with this");
+    const cancel = document.createElement("button");
+    cancel.className = "btn ghost"; cancel.textContent = "Cancel";
+    const hint = document.createElement("span");
+    hint.className = "hint"; hint.textContent = "Enter to save \u00b7 Shift+Enter for a line \u00b7 Esc to cancel";
+    row.append(save, cancel, hint);
+    box.append(ta, row);
+    anchor.insertAdjacentElement("afterend", box);
+    editing = { el: box, tab: t, rowA: rowA, rowB: rowB, stop: stopN || null };
+    ta.focus();
+
+    const commit = () => {
+      const note = ta.value.trim();
+      if (!note) { cancelEdit(); return; }
+      const live = editing !== null;   // false when flushEdit() already tore the box down
+      const stop = stopN || stopAt(t.rel, at.a, at.b);
+      const key = keyArg
+        || (stop ? "stop:" + stop : "line:" + t.rel + ":" + at.a + "-" + at.b);
+      const back = { path: t.path, spec: at.a + "-" + at.b };
+      // Writing a note IS rejecting: nobody stops to type when they are happy. So the
+      // comment carries the verdict with it, and one keypress of yours stays one undo.
+      const wasVerdict = verdicts.get(key);
+      const rejects = verdictOf(key) !== "reject";
+      if (existing) {
+        const was = existing.note;
+        pushUndo("edit of your comment on " + shortPath(t.rel), back, () => {
+          existing.note = was;
+          if (rejects) { if (wasVerdict) verdicts.set(key, wasVerdict); else verdicts.delete(key); }
+        });
+        existing.note = note;
+      } else {
+        pushUndo("your comment on " + shortPath(t.rel) + ":" + at.a, back, () => {
+          comments = comments.filter((x) => x.id !== id);
+          if (rejects) { if (wasVerdict) verdicts.set(key, wasVerdict); else verdicts.delete(key); }
+        });
+        const id = nextId++;
+        comments.push({
+          id: id, path: t.rel, view: t.path, key: key,
+          a: at.a, b: at.b, rowA: rowA, rowB: rowB, data: t.data,
+          rows: quote(t, rowA, rowB), note: note,
+          stop: stop, title: stopTitle(stop),
+        });
+      }
+      if (rejects) {
+        verdicts.set(key, {
+          key: key, path: t.rel, a: at.a, b: at.b, stop: stop, title: stopTitle(stop),
+          rows: quote(t, rowA, rowB), state: "reject",
+        });
+      }
+      editing = null;
+      box.remove();
+      if (live) afterComments(t);
+      else { renderReview(); renderTree(); saveDraft(); }
+    };
+    editing.commit = commit;
+    save.onclick = commit;
+    cancel.onclick = () => cancelEdit();
+    ta.addEventListener("keydown", (e) => {
+      // Enter finishes the comment. A note is a sentence or two, so the newline is the rare
+      // case and it gets the modifier, not the other way round.
+      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); commit(); }
+      if (e.key === "Escape") { e.preventDefault(); cancelEdit(); }
+    });
+    box.scrollIntoView({ block: "center", behavior: "smooth" });
+  }
+
+  function cancelEdit() {
+    if (editing) { editing.el.remove(); editing = null; }
+  }
+
+  // The box is about to be torn down by something other than you deciding. Anything you
+  // had written is kept — it is one click to delete a rough comment, and no clicks at all
+  // get the sentence back once the pane has been rebuilt under it.
+  function flushEdit() {
+    if (!editing) return;
+    const commit = editing.commit;
+    cancelEdit();
+    if (commit) commit();
+  }
+
+  // The gutter numbers a diff view by the file as it is now, so a row of removed code has
+  // no number of its own. Its anchor is the first numbered row of the same hunk, which is
+  // the line the removal sits at in the file that exists.
+  function anchorOf(t, rowA, rowB) { return anchorIn(t.data, rowA, rowB); }
+
+  function anchorIn(data, rowA, rowB) {
+    const nums = data.nums;
+    if (!nums) return { a: rowA + 1, b: rowB + 1 };
+    let a = 0, b = 0;
+    for (let i = rowA; i <= rowB && i < nums.length; i++) {
+      const v = Number(nums[i]);
+      if (!v) continue;
+      if (!a) a = v;
+      b = v;
+    }
+    if (!a) {               // nothing but removed lines: borrow the next numbered line
+      for (let i = rowB + 1; i < nums.length; i++) {
+        const v = Number(nums[i]);
+        if (v) { a = b = v; break; }
+      }
+    }
+    return { a: a || 1, b: b || a || 1 };
+  }
+
+  function quote(t, rowA, rowB) { return quoteIn(t.data, rowA, rowB); }
+
+  function quoteIn(data, rowA, rowB) {
+    const out = [];
+    for (let i = rowA; i <= rowB && i < data.lines.length; i++) {
+      out.push({
+        m: data.marks ? data.marks[i] : "",
+        n: data.nums ? data.nums[i] : String(i + 1),
+        t: data.lines[i].map((x) => x.t).join(""),
+      });
+    }
+    return out;
+  }
+
+  // What a verdict can be about. A hunk that a stop already covers belongs to that stop:
+  // the stop is the thing the agent proposed, and answering the same lines twice under two
+  // names would be two answers to one question.
+  function stopTarget(s) {
+    return { key: "stop:" + s.n, stop: s.n, title: s.title, path: s.path,
+             a: s.a, b: s.b, rows: null };
+  }
+
+  function hunkTarget(t, h) { return hunkTargetIn(t.rel, t.data, h); }
+
+  // The key a hunk has when no stop is allowed to speak for it.
+  function hunkKeyBare(path, h) { return "hunk:" + path + ":" + h.at; }
+
+  // The stop whose declared range covers one line of one file, if any.
+  function stopForLine(path, line) {
+    if (!line) return null;
+    for (const s of stops) {
+      if (s.path !== path || s.missing || !s.a) continue;
+      if (line >= s.a && line <= s.b) return s;
+    }
+    return null;
+  }
+
+  // Which change each row belongs to, for the purpose of lighting one of them up.
+  //
+  // A new file is a single hunk covering every line, so using the hunk here lit the whole
+  // file when a stop pointed at twelve lines of it. A stop's own range is what the agent
+  // declared and what you are deciding on, so inside a stop the stop wins; outside it, the
+  // rows fall back to their hunk, which is still a change you have not judged.
+  function rowKeys(t) {
+    const rh = rowHunks(t);
+    const nums = t.data.nums;
+    const out = new Array(t.data.lines.length).fill("");
+    for (let i = 0; i < out.length; i++) {
+      const h = rh ? rh[i] : null;
+      if (!h) continue;
+      let line = nums ? Number(nums[i]) : i + 1;
+      if (!line) {                       // a removed row borrows the next real line
+        for (let j = i + 1; j < out.length; j++) {
+          const v = Number(nums[j]);
+          if (v) { line = v; break; }
+        }
+      }
+      const s = stopForLine(t.rel, line);
+      out[i] = s ? "stop:" + s.n : hunkKeyBare(t.rel, h);
+    }
+    return out;
+  }
+
+  function hunkTargetIn(path, data, h) {
+    const at = anchorIn(data, h.at, h.at + h.rows - 1);
+    const stop = stopAt(path, at.a, at.b);
+    return {
+      key: stop ? "stop:" + stop : "hunk:" + path + ":" + h.at,
+      stop: stop, title: stop ? stopTitle(stop) : "",
+      path: path, a: at.a, b: at.b,
+      get rows() { return quoteIn(data, h.at, h.at + h.rows - 1); },
+    };
+  }
+
+  function verdictOf(key) {
+    const v = verdicts.get(key);
+    return v ? v.state : "";
+  }
+
+  // Clicking the verdict you already gave takes it back, which is the only undo it needs.
+  // A rejection with no reason is almost useless to the agent, so saying no opens the box
+  // for why — but it does not force one: the verdict stands either way, and the output
+  // says plainly when none was given.
+  function setVerdict(target, state, t) {
+    const had = verdictOf(target.key);
+    const prev = verdicts.get(target.key);
+    const back = target.a ? { path: viewFor(target.path), spec: target.a + "-" + target.b } : null;
+    pushUndo((had === state ? "took back " : "") + (state === "approve" ? "approve" : "reject")
+             + " on " + (target.stop ? "stop " + target.stop : shortPath(target.path)),
+             back,
+             () => { if (prev) verdicts.set(target.key, prev); else verdicts.delete(target.key); });
+    if (had === state) verdicts.delete(target.key);
+    else verdicts.set(target.key, Object.assign({}, target, { state: state }));
+    const want = had !== state && state === "reject"
+                 && !comments.some((c) => c.key === target.key);
+    const tb = t || tab(active);
+    afterComments(tb);
+    // Approving is done with that change, so it moves you to the next one — from wherever
+    // the approval was given, not from wherever you happened to be standing. Rejecting does
+    // not: the box for the reason is about to open on these very lines.
+    if (had !== state && state === "approve") {
+      const at = walkIndexOf(target.key);
+      if (at >= 0) { gotoWalk(at + 1); return; }
+    }
+    if (!want || !tb) return;
+    const a = target.a ? rowOf(tb, target.a) : 0;
+    const b = target.b ? rowOf(tb, target.b) : 0;
+    startComment(tb, a < 0 ? 0 : a, b < 0 ? (a < 0 ? 0 : a) : b, target.stop, null,
+                 target.key, "Why not?");
+  }
+
+  function verdictBtns(target, t, cls) {
+    const wrap = document.createElement("span");
+    wrap.style.display = "inline-flex";
+    wrap.style.gap = "5px";
+    const st = verdictOf(target.key);
+    const pair = [["approve", "\u2713", "yes"], ["reject", "\u2717", "nope"]];
+    for (const p of pair) {
+      const b = document.createElement("button");
+      b.className = (cls || "vb") + " " + p[2] + (st === p[0] ? " on" : "");
+      b.textContent = p[1];
+      b.title = st === p[0]
+        ? "take back the " + (p[0] === "approve" ? "approval" : "rejection")
+        : (p[0] === "approve" ? "approve this" : "reject this");
+      b.onclick = (e) => { e.stopPropagation(); setVerdict(target, p[0], t); };
+      wrap.appendChild(b);
+    }
+    return wrap;
+  }
+
+  // ---------------- the walk, and taking it back ----------------
+  // ONE order over the whole review: the agent's stops as it ordered them, then every hunk
+  // it gave no stop to, file by file. It is deliberately independent of what happens to be
+  // open — a change in a file you have not opened yet is exactly the one you must not skip,
+  // so the page fetches every changed file's diff up front and walks all of them.
+  let walkIdx = -1;
+  let prefetched = false;
+  const diffCache = new Map();        // path -> /api/change payload
+
+  function walk() {
+    const out = [];
+    stops.forEach((st, i) => out.push({
+      kind: "stop", si: i, s: st, path: st.path, key: "stop:" + st.n,
+      label: st.title || shortPath(st.path),
+      at: st.a ? (st.a === st.b ? String(st.a) : st.a + "-" + st.b) : "",
+    }));
+    for (const e of chgItems) {
+      const d = diffCache.get(e.path);
+      if (!d || !d.hunks) continue;
+      d.hunks.forEach((h, hi) => {
+        const tg = hunkTargetIn(e.path, d, h);
+        if (tg.stop) return;          // a stop already speaks for these lines
+        out.push({
+          kind: "hunk", path: e.path, hi: hi, h: h, key: tg.key, tg: tg,
+          label: shortPath(e.path), at: String(tg.a),
+          counts: "−" + h.removed + " +" + h.added,
+        });
+      });
+    }
+    return out;
+  }
+
+  function walkIndexOf(key) {
+    const w = walk();
+    for (let i = 0; i < w.length; i++) if (w[i].key === key) return i;
+    return -1;
+  }
+
+  async function gotoWalk(i) {
+    const w = walk();
+    if (!w.length) return;
+    if (i >= w.length) {
+      flash(prefetched ? "that was the last change \u2014 Send when you are ready"
+                       : "still reading the other diffs\u2026");
+      return;
+    }
+    const n = Math.max(0, Math.min(w.length - 1, i));
+    const it = w[n];
+    if (it.kind === "stop") { await gotoStop(it.si); return; }
+    curStop = -1;
+    walkIdx = -1;                 // so markCurrent() does not treat this as a no-op
+    const t = await openFile(CHG + it.path);
+    renderReview();
+    markCurrent(n, true);
     if (!t) return;
-    t.hl = new Set();
-    codeEl.querySelectorAll(".ln.hl").forEach((r) => r.classList.remove("hl"));
-    $("clearHl").disabled = true;
-  };
+    revealTop(codeEl.querySelectorAll(".hunk")[it.hi]);
+  }
 
-  // ---------------- gutter selection ----------------
+  // Every changed file's diff, up front, so the walk is complete before you start it. One
+  // at a time and rendering as they land: the list grows in front of you instead of the
+  // page sitting blank until the last one arrives.
+  async function prefetchDiffs() {
+    for (const e of chgItems) {
+      if (e.binary || diffCache.has(e.path)) continue;
+      try {
+        const d = await fetch(R("change") + "?path=" + encodeURIComponent(e.path))
+                        .then((r) => r.json());
+        if (!d.error) diffCache.set(e.path, d);
+      } catch (err) { /* a file we cannot read is reported by the list itself */ }
+      renderReview();
+    }
+    prefetched = true;
+    renderReview();
+  }
+
+  // What a bare a/r/c acts on: the SELECTED item — the one highlighted in the review pane
+  // and named in the status bar. It used to be whatever sat at the top of the viewport,
+  // which is wrong whenever two changes are on screen at once: jumping to a stop that lives
+  // above another one left both visible and the verdict went to the wrong one.
+  function keyTarget() {
+    const cur = walk()[walkIdx];
+    if (cur) return cur.kind === "stop" ? stopTarget(cur.s) : cur.tg;
+    return viewportTarget();      // nothing selected yet, so fall back to what is on screen
+  }
+
+  // Only for deciding what you have scrolled to, never for deciding what a key acts on.
+  function viewportTarget() {
+    const t = tab(active);
+    if (t && t.data.hunks && t.data.hunks.length) {
+      const sc = $("scroll");
+      // The same offset reveal uses, so "what is at the top" means "what you are reading".
+      const top = sc.getBoundingClientRect().top + lead();
+      const boxes = codeEl.querySelectorAll(".hunk");
+      let best = null;
+      for (let i = 0; i < boxes.length; i++) {
+        const r = boxes[i].getBoundingClientRect();
+        if (r.bottom > top) { best = i; break; }
+      }
+      if (best !== null && t.data.hunks[best]) return hunkTarget(t, t.data.hunks[best]);
+    }
+    if (stops[curStop] && !stops[curStop].missing) return stopTarget(stops[curStop]);
+    return null;
+  }
+
+  // Every change to the review, with the inverse and the place it happened. u walks back
+  // up it: undoing a verdict you gave three files ago without being shown where it was
+  // would be a worse trick than making you find it yourself.
+  const undoLog = [];
+
+  function pushUndo(label, where, fn) {
+    undoLog.push({ label: label, where: where, undo: fn });
+    if (undoLog.length > 200) undoLog.shift();
+  }
+
+  async function undoLast() {
+    const it = undoLog.pop();
+    if (!it) { flash("nothing to undo"); return; }
+    it.undo();
+    if (it.where && it.where.path) {
+      await openFile(it.where.path, it.where.spec || "");
+    }
+    afterComments(tab(active));
+    flash("undone: " + it.label);
+  }
+
+  function stopAt(path, a, b) {
+    for (const s of stops) {
+      if (s.path !== path || s.missing) continue;
+      if (!s.a) return s.n;                       // a stop on the whole file
+      if (a <= s.b && b >= s.a) return s.n;
+    }
+    return null;
+  }
+
+  function stopTitle(n) {
+    const s = stops.find((x) => x.n === n);
+    return s ? s.title : "";
+  }
+
+  function dropComment(id) {
+    const gone = comments.find((c) => c.id === id);
+    if (gone) {
+      pushUndo("deleting your comment on " + shortPath(gone.path) + ":" + gone.a,
+               { path: gone.view || viewFor(gone.path), spec: gone.a + "-" + gone.b },
+               () => { comments.push(gone); });
+    }
+    comments = comments.filter((c) => c.id !== id);
+    afterComments(tab(active));
+  }
+
+  async function editComment(c) {
+    const t = await openFile(c.view || viewFor(c.path));
+    if (!t) return;
+    // A comment restored from the server knows the lines it is about but not the rows they
+    // were drawn on, so those are looked up again in whatever is open now.
+    const a = c.rowA >= 0 ? c.rowA : rowOf(t, c.a);
+    const b = c.rowB >= 0 ? c.rowB : rowOf(t, c.b);
+    startComment(t, a < 0 ? 0 : a, b < 0 ? (a < 0 ? 0 : a) : b, c.stop, c, c.key);
+  }
+
+  function afterComments(t) {
+    if (t) { const sc = $("scroll"), at = sc.scrollTop; renderCode(t, false); sc.scrollTop = at; }
+    renderReview();
+    renderTree();
+    saveDraft();
+  }
+
+  async function commentOnStop(s) {
+    const t = await gotoStop(stops.indexOf(s));
+    if (!t) return;
+    const a = s.a ? rowOf(t, s.a) : 0;
+    const b = s.b ? rowOf(t, s.b) : 0;
+    startComment(t, a < 0 ? 0 : a, b < 0 ? (a < 0 ? 0 : a) : b, s.n, null, "stop:" + s.n);
+  }
+
+  // ---------------- selection ----------------
   let dragFrom = null;
   codeEl.addEventListener("pointerdown", (e) => {
+    // The bare keys belong to the editor, so clicking in it has to be what hands them over.
+    $("scroll").focus({ preventScroll: true });
     const no = e.target.closest(".no");
     if (!no) return;
     e.preventDefault();
@@ -2356,97 +2381,9 @@ textarea:focus { outline: none; border-color: var(--accent); }
       const n = Number(r.dataset.n);
       r.classList.toggle("sel", !!sel && n >= sel.a && n <= sel.b);
     });
-    const ctx = $("ctx");
-    if (sel) {
-      ctx.hidden = false; ctx.textContent = "";
-      const s = document.createElement("span");
-      s.textContent = t.path + ":" + (sel.a === sel.b ? sel.a : sel.a + "-" + sel.b);
-      const add = document.createElement("button");
-      add.textContent = "add to chat";
-      add.onclick = () => { addRef(t.path, sel.a, sel.b); t.sel = null; paintSel(); };
-      const c = document.createElement("button");
-      c.textContent = "clear";
-      c.onclick = () => { t.sel = null; paintSel(); };
-      ctx.append(s, add, c);
-      $("stSel").textContent = (sel.b - sel.a + 1) + " selected";
-    } else { ctx.hidden = true; $("stSel").textContent = ""; }
+    $("stSel").textContent = sel ? (sel.b - sel.a + 1) + " selected · Ctrl+L to comment" : "";
   }
 
-  // ---------------- references you attach ----------------
-  // The mirror image of my [[open:...]] chips: you point at code, it rides along with the question.
-  let refs = [];
-  const MAX_REF_LINES = 200;
-
-  function lineText(t, a, b) {
-    return t.data.lines.slice(a - 1, b).map((segs) => segs.map((x) => x.t).join("")).join("\n");
-  }
-
-  function addRef(path, a, b) {
-    const t = tab(path);
-    if (!t) return;
-    if (refs.some((r) => r.path === path && r.a === a && r.b === b)) return;
-    let text = lineText(t, a, Math.min(b, a + MAX_REF_LINES - 1));
-    const clipped = b - a + 1 > MAX_REF_LINES;
-    refs.push({ path: path, a: a, b: b, text: text, clipped: clipped });
-    renderRefs();
-    boxEl.focus();
-  }
-
-  function refLabel(r) {
-    const where = shortPath(realPath(r.path)) + ":" + (r.a === r.b ? r.a : r.a + "-" + r.b);
-    return r.reject ? "rejected \u00b7 " + where : where;
-  }
-
-  // The model must never have to guess which text it is being shown. A line range means
-  // nothing without the tree it came from, and these two are the whole reason attaching
-  // beats typing: the user says "too verbose", and the path, the range, the exact text and
-  // the version it belongs to are filled in around those two words.
-  function realPath(p) {
-    return p.startsWith(CHG) ? p.slice(CHG.length) : p;
-  }
-
-  function srcNote(p) {
-    if (!p.startsWith(CHG)) return "";
-    return " (your version on this branch" + (chgBase ? ", changed vs " + chgBase : "") + ")";
-  }
-
-  function refChip(r, onRemove) {
-    const el = document.createElement("span");
-    el.className = "ref" + (r.reject ? " reject" : "");
-    const lbl = document.createElement("span");
-    lbl.className = "lbl";
-    lbl.textContent = refLabel(r);
-    lbl.title = r.path + " lines " + r.a + "-" + r.b + (r.clipped ? " (first " + MAX_REF_LINES + " sent)" : "");
-    lbl.onclick = () => openFile(r.path, r.a + "-" + r.b);
-    el.appendChild(lbl);
-    if (onRemove) {
-      const x = document.createElement("span");
-      x.className = "x";
-      x.textContent = "\u00d7";
-      x.onclick = onRemove;
-      el.appendChild(x);
-    }
-    return el;
-  }
-
-  function renderRefs() {
-    const bar = $("refs");
-    bar.textContent = "";
-    bar.hidden = !refs.length;
-    refs.forEach((r, i) => {
-      bar.appendChild(refChip(r, () => {
-        // Closing the box IS undoing the rejection -- two ways to say the same thing that
-        // disagreed would be worse than either.
-        if (r.hunk) review.delete(r.hunk);
-        refs.splice(i, 1);
-        renderRefs();
-        const t = tab(active); if (t) renderCode(t, false);
-        updateAllGood();
-      }));
-    });
-  }
-
-  // -- attach from a free text selection inside the code ----------------------
   function selectedLineRange() {
     const s = window.getSelection();
     if (!s || s.isCollapsed || !s.rangeCount) return null;
@@ -2463,13 +2400,13 @@ textarea:focus { outline: none; border-color: var(--accent); }
   function hideFloat() { addBtn.hidden = true; }
   function showFloat(r) {
     addBtn.hidden = false;
-    const top = Math.max(34, r.rect.top - 30);
-    addBtn.style.top = top + "px";
+    addBtn.style.top = Math.max(34, r.rect.top - 30) + "px";
     addBtn.style.left = Math.min(window.innerWidth - 140, Math.max(8, r.rect.left)) + "px";
     addBtn.onclick = () => {
-      addRef(active, r.a, r.b);
+      const t = tab(active);
       window.getSelection().removeAllRanges();
       hideFloat();
+      if (t) startComment(t, r.a - 1, r.b - 1);
     };
   }
   $("scroll").addEventListener("mouseup", () => {
@@ -2481,1456 +2418,442 @@ textarea:focus { outline: none; border-color: var(--accent); }
   $("scroll").addEventListener("scroll", hideFloat);
   document.addEventListener("mousedown", (e) => { if (e.target !== addBtn) hideFloat(); });
 
-  // -- keyboard: ctrl-L attaches whatever is selected -------------------------
-  document.addEventListener("keydown", (e) => {
-    if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "l") return;
-    const t = tab(active);
-    if (!t) return;
-    const r = selectedLineRange();
-    if (r) {
-      e.preventDefault();
-      addRef(active, r.a, r.b);
-      window.getSelection().removeAllRanges();
-      hideFloat();
-    } else if (t.sel) {
-      e.preventDefault();
-      addRef(active, t.sel.a, t.sel.b);
-      t.sel = null;
-      paintSel();
+  // ---------------- the review pane ----------------
+  function renderReview() {
+    renderWalkPane();
+    renderLoose();
+    const vs = Array.from(verdicts.values());
+    const ok = vs.filter((v) => v.state === "approve").length;
+    const no = vs.filter((v) => v.state === "reject").length;
+    const nc = comments.length + ($("general").value.trim() ? 1 : 0);
+    const c = $("count");
+    c.textContent = "";
+    if (!ok && !no && !nc) c.textContent = "nothing said yet";
+    else {
+      const bits = [];
+      if (ok) bits.push(["y", ok + " approved"]);
+      if (no) bits.push(["n", no + " rejected"]);
+      if (nc) bits.push(["", nc + " comment" + (nc === 1 ? "" : "s")]);
+      bits.forEach((bit, i) => {
+        if (i) c.appendChild(document.createTextNode(" · "));
+        const sp = document.createElement("span");
+        if (bit[0]) sp.className = bit[0];
+        sp.textContent = bit[1];
+        c.appendChild(sp);
+      });
+      c.appendChild(document.createTextNode(" to send"));
     }
+    // The same two numbers in the pane head, so you can see how far the walk has got
+    // without reading to the bottom of it.
+    const tl = $("tally");
+    tl.textContent = "";
+    if (ok || no) {
+      const y = document.createElement("span"); y.className = "y"; y.textContent = "✓" + ok;
+      const z = document.createElement("span"); z.className = "n"; z.textContent = " ✗" + no;
+      tl.append(y, z);
+    }
+    const wl = walk().length;
+    $("stopPos").textContent = wl ? (walkIdx + 1) + "/" + wl : "";
+    $("stopPrev").disabled = walkIdx <= 0;
+    $("stopNext").disabled = !wl || walkIdx >= wl - 1;
+    renderProgress();
+  }
+
+  // An overview, and only that: position, what it is, and your verdict. The agent's own
+  // note is already in the margin beside the code it is about, and printing it twice made
+  // this pane a wall of prose you had to scroll past to see where you were.
+  function renderWalkPane() {
+    const el = $("stops");
+    el.textContent = "";
+    const w = walk();
+    if (!w.length) {
+      const d = document.createElement("div");
+      d.className = "dimnote";
+      d.textContent = chgItems.length
+        ? "Reading the diffs\u2026"
+        : "Nothing differs from " + (chgBase || "the base") + ".";
+      el.appendChild(d);
+      return;
+    }
+    let section = null;
+    w.forEach((it, i) => {
+      const want = it.kind === "stop" ? "stops \u00b7 in reading order"
+                                      : "other changes \u00b7 no stop";
+      if (want !== section) {
+        section = want;
+        const mine = w.filter((x) => x.kind === it.kind);
+        const done = mine.filter((x) => verdictOf(x.key)).length;
+        const h = document.createElement("div");
+        h.className = "sect";
+        h.textContent = want + "  \u00b7  " + done + "/" + mine.length;
+        el.appendChild(h);
+      }
+      el.appendChild(walkRow(it, i));
+    });
+    // A file git calls binary has no diff to walk, and saying so beats leaving it out.
+    const blind = chgItems.filter((e) => e.binary || (prefetched && !diffCache.has(e.path)));
+    if (blind.length) {
+      const h = document.createElement("div");
+      h.className = "sect";
+      h.textContent = "changed, nothing to show";
+      el.appendChild(h);
+      for (const e of blind) {
+        const d = document.createElement("div");
+        d.className = "dimnote";
+        d.textContent = e.path + " \u2014 " + (e.binary ? "binary" : "could not be read");
+        el.appendChild(d);
+      }
+    }
+  }
+
+  // The bar, the count, and the one line of it that sits in the editor's own status bar —
+  // because while you are reading code that is the only one of the three you can see.
+  function renderProgress() {
+    const w = walk();
+    const total = w.length;
+    let ok = 0, no = 0, said = 0;
+    for (const it of w) {
+      const st = verdictOf(it.key);
+      if (st === "approve") ok++;
+      else if (st === "reject") no++;
+      else if (comments.some((c) => c.key === it.key)) said++;
+    }
+    const el = $("progress");
+    const bars = el.querySelectorAll(".bar i");
+    bars[0].style.width = total ? (100 * ok / total) + "%" : "0";
+    bars[1].style.width = total ? (100 * no / total) + "%" : "0";
+    const txt = el.querySelector(".txt");
+    txt.textContent = "";
+    if (!total) { txt.textContent = prefetched ? "nothing to review" : "reading\u2026"; }
+    else {
+      const b = document.createElement("b");
+      b.textContent = (ok + no) + " of " + total;
+      txt.append(b, document.createTextNode(" judged"
+        + (said ? " \u00b7 " + said + " commented" : "")
+        + (total - ok - no - said > 0 ? " \u00b7 " + (total - ok - no - said) + " to go" : "")));
+    }
+    const sp = $("stPos");
+    const cur = w[walkIdx];
+    sp.textContent = total && walkIdx >= 0
+      ? "change " + (walkIdx + 1) + " of " + total
+        + (cur ? "  \u00b7  " + cur.label : "")
+        + (prefetched ? "" : "  (still reading)")
+      : "";
+  }
+
+  // Move the highlight without rebuilding the pane: this runs on every scroll frame, and
+  // a full re-render there would make the editor feel heavy for no reason.
+  function markCurrent(i, scrollIntoList) {
+    if (i < 0 || i === walkIdx) return;
+    walkIdx = i;
+    // Relight the code without rebuilding it: the rows carry the key of the change they
+    // belong to, so this is a class toggle per row and nothing more.
+    const key = (walk()[i] || {}).key || "";
+    codeEl.querySelectorAll(".ln").forEach((r) => {
+      r.classList.toggle("cur", !!r.dataset.key && r.dataset.key === key);
+    });
+    const rows = $("stops").querySelectorAll(".wrow");
+    rows.forEach((r, n) => r.classList.toggle("on", n === i));
+    $("stopPos").textContent = rows.length ? (i + 1) + "/" + rows.length : "";
+    $("stopPrev").disabled = i <= 0;
+    $("stopNext").disabled = i >= rows.length - 1;
+    renderProgress();
+    if (scrollIntoList && rows[i]) rows[i].scrollIntoView({ block: "nearest" });
+  }
+
+  // What the eye is on, told by the viewport rather than by the last key pressed. Without
+  // this the highlight only moved for n/p, so it quietly lied as soon as you scrolled.
+  // Scrolling moves the selection only when what is selected has gone off screen
+  // altogether. Reading around the item you are judging is not a decision to judge
+  // something else, and the old rule turned every scroll into one.
+  function syncToViewport() {
+    if (Date.now() - scrollLock < 500) return;
+    const cur = walk()[walkIdx];
+    if (cur && onScreen(cur)) return;
+    const tg = viewportTarget();
+    if (!tg) return;
+    markCurrent(walkIndexOf(tg.key), true);
+  }
+
+  function onScreen(item) {
+    const t = tab(active);
+    if (!t) return false;
+    let el = null;
+    if (item.kind === "stop") {
+      if (t.rel !== item.s.path || !item.s.a) return false;
+      const r = rowOf(t, item.s.a);
+      if (r >= 0) el = codeEl.querySelector('.ln[data-n="' + (r + 1) + '"]');
+    } else {
+      if (t.rel !== item.path) return false;
+      el = codeEl.querySelectorAll(".hunk")[item.hi] || null;
+    }
+    if (!el) return false;
+    const box = $("scroll").getBoundingClientRect();
+    const at = el.getBoundingClientRect();
+    return at.bottom > box.top && at.top < box.bottom;
+  }
+
+  let syncTimer = 0;
+  $("scroll").addEventListener("scroll", () => {
+    clearTimeout(syncTimer);
+    syncTimer = setTimeout(syncToViewport, 90);
   });
 
-  // ---------------- watching ----------------
-  async function watchFile(t) {
-    const token = ++watchToken;
-    while (token === watchToken && active === t.path) {
-      try {
-        const r = await fetch("/api/watch?path=" + encodeURIComponent(t.path) + "&mtime=" + t.data.mtime).then((x) => x.json());
-        if (token !== watchToken) return;
-        if (r.changed) {
-          t.data = r;
-          renderCode(t, false);
-          flash("reloaded");
-        }
-      } catch (e) {
-        $("stState").textContent = "disconnected";
-        await new Promise((res) => setTimeout(res, 2000));
-      }
+  function walkRow(it, i) {
+    const st = verdictOf(it.key);
+    const row = document.createElement("div");
+    row.className = "wrow" + (i === walkIdx ? " on" : "")
+                  + (st === "approve" ? " ok" : st === "reject" ? " no" : "")
+                  + (it.kind === "stop" && it.s.missing ? " gone" : "");
+    const mark = document.createElement("span");
+    mark.className = "k";
+    mark.textContent = st === "approve" ? "\u2713" : st === "reject" ? "\u2717"
+                     : it.kind === "stop" ? it.s.n + "." : "\u00b7";
+    const lbl = document.createElement("span");
+    lbl.className = "t";
+    lbl.textContent = it.label;
+    const at = document.createElement("span");
+    at.className = "a";
+    at.textContent = (it.at ? ":" + it.at : "") + (it.counts ? "  " + it.counts : "")
+                   + (it.kind === "stop" && it.s.missing ? "  (no such file)" : "");
+    row.append(mark, lbl, at);
+    const mine = comments.filter((c) => c.key === it.key);
+    if (mine.length) {
+      const c = document.createElement("span");
+      c.className = "c";
+      c.textContent = "\u25cf" + (mine.length > 1 ? mine.length : "");
+      c.title = mine.length + " comment(s) of yours here";
+      row.appendChild(c);
     }
-  }
-  function flash(msg) {
-    $("stState").textContent = msg;
-    setTimeout(() => { if (!busy) $("stState").textContent = "ready"; }, 2000);
+    row.onclick = () => gotoWalk(i);
+    return row;
   }
 
-  // ---------------- reply rendering ----------------
-  const OPEN_RE = /\[\[open:\s*([^\]|:]+?)\s*(?::\s*([\d,\s-]+?))?\s*(?:\|\s*([^\]]*?)\s*)?\]\]/g;
-  const EDIT_RE = /\[\[edit:\s*([^\]|:]+?)\s*:\s*(\d+)\s*-\s*(\d+)\s*\]\]\n?([\s\S]*?)\[\[\/edit\]\]/g;
-  // The spoken form of a sentence that had to be written in symbols. It never shows in
-  // the chat; the narrator swaps it in for the sentence it follows.
-  const SAY_RE = /\[\[say:\s*([\s\S]*?)\]\]/g;
-  // The same directive, used to cut one answer into the parts a reader walks through.
-  const CONT_G = /\[\[continue(?::\s*([^\]]*?))?\s*\]\]/g;   // a part break
-
-  // Every [[continue:]] in the text, as {at, end, label}.
-  function breaks(text) {
-    const out = [];
-    let m;
-    CONT_G.lastIndex = 0;
-    while ((m = CONT_G.exec(text))) {
-      out.push({ at: m.index, end: m.index + m[0].length, label: (m[1] || "").trim() });
-    }
-    return out;
+  function cmtRow(c) {
+    const el = document.createElement("div");
+    el.className = "cmt";
+    const x = document.createElement("span");
+    x.className = "x"; x.textContent = "×"; x.title = "delete";
+    x.onclick = (e) => { e.stopPropagation(); dropComment(c.id); };
+    const w = document.createElement("span");
+    w.className = "where";
+    w.textContent = shortPath(c.path) + ":" + (c.a === c.b ? c.a : c.a + "-" + c.b);
+    w.onclick = (e) => { e.stopPropagation(); openFile(c.view || viewFor(c.path), c.a + "-" + c.b); };
+    el.append(x, w, document.createTextNode(c.note));
+    return el;
   }
 
-  // The first `n` parts of an answer, as one piece of text.
-  function revealed(text, n) {
-    const bs = breaks(text);
-    return n > bs.length ? text : text.slice(0, bs[n - 1].at);
-  }
-
-  // The label on the button that reveals part n+1, or null when there is no more.
-  function breakLabel(text, n) {
-    const bs = breaks(text);
-    return n <= bs.length ? bs[n - 1].label : null;
-  }
-  const TITLE_RE = /\[\[title:\s*([^\]]*?)\s*\]\]/;
-
-  function renderReply(el, text) {
+  // Comments that belong to nothing in the walk — on an unchanged file, say. They are the
+  // only ones this pane shows in full, because there is nowhere else they would be seen.
+  function renderLoose() {
+    const el = $("loose");
     el.textContent = "";
-    text = text.replace(CONT_G, "").replace(TITLE_RE, "")     // control signals, not prose
-               .replace(SAY_RE, "");
-    let cursor = 0, m;
-    EDIT_RE.lastIndex = 0;
-    while ((m = EDIT_RE.exec(text))) {
-      prose(el, text.slice(cursor, m.index));
-      el.appendChild(strayEdit(m[1], Number(m[2]), Number(m[3]), m[4].replace(/\n$/, "")));
-      cursor = m.index + m[0].length;
-    }
-    const tail = text.slice(cursor);
-    const open = tail.lastIndexOf("[[edit:");
-    if (open !== -1) {
-      prose(el, tail.slice(0, open));
-      const p = document.createElement("p");
-      p.className = "notice"; p.textContent = "preparing an edit…";
-      el.appendChild(p);
-    } else prose(el, tail);
+    const keys = new Set(walk().map((w) => w.key));
+    const loose = comments.filter((c) => !keys.has(c.key));
+    if (!loose.length) return;
+    const h = document.createElement("div");
+    h.className = "sect";
+    h.textContent = "your comments elsewhere";
+    el.appendChild(h);
+    loose.sort((a, b) => a.path.localeCompare(b.path) || a.a - b.a);
+    for (const c of loose) el.appendChild(cmtRow(c));
   }
 
-  // A fenced block is code that is NOT in the repo yet — a proposal, a sketch, an
-  // alternative. Code that IS in the repo belongs in the center pane via [[open:]].
-  const FENCE_RE = /```[\w.+-]*\n?([\s\S]*?)```/g;
-
-  function snippet(code, live) {
-    const pre = document.createElement("pre");
-    pre.className = "snip" + (live ? " live" : "");
-    pre.textContent = code.replace(/\n$/, "");
-    return pre;
+  async function gotoStop(i) {
+    if (i < 0 || i >= stops.length) return null;
+    curStop = i;
+    walkIdx = i;              // stops come first in the walk, so the index is the same
+    const s = stops[i];
+    renderReview();
+    const row = $("stops").querySelector(".wrow.on");
+    if (row) row.scrollIntoView({ block: "nearest" });
+    if (s.missing) return null;
+    const t = await openFile(viewFor(s.path), s.a ? s.a + "-" + s.b : "");
+    return t;
   }
 
-  function prose(el, text) {
-    if (!text.trim()) return;
-    let last = 0, m;
-    FENCE_RE.lastIndex = 0;
-    while ((m = FENCE_RE.exec(text))) {
-      paras(el, text.slice(last, m.index));
-      el.appendChild(snippet(m[1], false));
-      last = m.index + m[0].length;
-    }
-    const tail = text.slice(last);
-    // A fence still being written: show it as a block immediately rather than as
-    // paragraphs full of backticks that reflow the moment it closes.
-    const openFence = tail.search(/```[\w.+-]*\n/);
-    if (openFence !== -1) {
-      paras(el, tail.slice(0, openFence));
-      el.appendChild(snippet(tail.slice(openFence).replace(/^```[\w.+-]*\n?/, ""), true));
-    } else {
-      paras(el, tail);
-    }
+  $("stopPrev").onclick = () => gotoWalk(walkIdx - 1);
+  $("stopNext").onclick = () => gotoWalk(walkIdx + 1);
+
+  // ---------------- sending ----------------
+  function payload() {
+    return {
+      items: comments.map((c) => ({
+        key: c.key, path: c.path, a: c.a, b: c.b, stop: c.stop, title: c.title,
+        rows: c.rows, note: c.note,
+      })),
+      verdicts: Array.from(verdicts.values()).map((v) => ({
+        key: v.key, path: v.path, a: v.a, b: v.b, stop: v.stop, title: v.title,
+        rows: v.rows, state: v.state,
+      })),
+      general: $("general").value,
+    };
   }
 
-  function paras(el, text) {
-    if (!text.trim()) return;
-    for (const para of text.split(/\n{2,}/)) {
-      if (!para.trim()) continue;
-      const p = document.createElement("p");
-      // Directives are resolved FIRST, because a label may itself contain backticks
-      // -- [[open:path|`thing`]] is normal for Claude to write, and splitting on inline
-      // code before matching would tear the directive in half and print it raw. A
-      // directive that is entirely wrapped in backticks is still just quoted syntax,
-      // and scanDirectives leaves it as code.
-      scanDirectives(p, para);
-      el.appendChild(p);
-    }
+  // Kept server-side as you type, so a tab closed by accident does not take the review
+  // with it. It is a draft either way: only Send says you are finished.
+  let draftTimer = 0;
+  function saveDraft() {
+    clearTimeout(draftTimer);
+    draftTimer = setTimeout(() => {
+      fetch(R("draft"), {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload()),
+      }).catch(() => {});
+    }, 400);
   }
 
-  // Bold and italic. Underscore forms are deliberately NOT supported: identifiers
-  // like input_patch_len appear constantly in this prose and would false-italicize.
-  const EMPH_RE = /(\*\*[^*\n]+\*\*|\*[^*\n]+\*)/;
-
-  function emitText(p, text) {
-    if (!text) return;
-    for (const bit of text.split(EMPH_RE)) {
-      if (!bit) continue;
-      if (bit.length > 4 && bit.startsWith("**") && bit.endsWith("**")) {
-        const b = document.createElement("strong");
-        b.textContent = bit.slice(2, -2);
-        p.appendChild(b);
-      } else if (bit.length > 2 && bit.startsWith("*") && bit.endsWith("*")) {
-        const i = document.createElement("em");
-        i.textContent = bit.slice(1, -1);
-        p.appendChild(i);
-      } else {
-        p.appendChild(document.createTextNode(bit));
-      }
-    }
-  }
-
-  // Inline code and emphasis, for the stretches between directives.
-  function codeAndEmph(p, text) {
-    if (!text) return;
-    for (const bit of text.split(/(`[^`\n]+`)/)) {
-      if (!bit) continue;
-      if (bit.length > 2 && bit.startsWith("`") && bit.endsWith("`")) {
-        const c = document.createElement("code");
-        c.textContent = bit.slice(1, -1);
-        p.appendChild(c);
-      } else emitText(p, bit);
-    }
-  }
-
-  // Inline-code spans, the one place both the renderer and the narrator agree on
-  // what counts as a directive: one that sits INSIDE a span is quoted syntax, one that
-  // merely CONTAINS a span in its label is a real directive.
-  function codeSpans(text) {
-    const spans = [];
-    const re = /`[^`\n]+`/g;
-    let m;
-    while ((m = re.exec(text))) spans.push([m.index, m.index + m[0].length]);
-    return spans;
-  }
-
-  function scanDirectives(p, text) {
-    const spans = codeSpans(text);
-    let last = 0, m;
-    OPEN_RE.lastIndex = 0;
-    while ((m = OPEN_RE.exec(text))) {
-      const path = m[1], spec = m[2] || "", label = (m[3] || "").replace(/`/g, "");
-      if (!isPath(path)) continue;
-      // Quoted syntax: left where it is, and rendered as the code it is.
-      if (spans.some(([a, b]) => m.index >= a && m.index + m[0].length <= b)) continue;
-      codeAndEmph(p, text.slice(last, m.index));
-      const chip = document.createElement("button");
-      chip.className = "chip";
-      chip.textContent = label ? label + " \u00b7 " + shortPath(path) + (spec ? ":" + spec : "")
-                               : shortPath(path) + (spec ? ":" + spec : "");
-      chip.dataset.key = chipKey(path, spec);
-      chip.onclick = () => {
-        const body = chip.closest(".body");
-        if (body) body.querySelectorAll(".chip").forEach((c) => c.classList.remove("active"));
-        chip.classList.add("active");
-        openFile(path, spec);
-      };
-      p.appendChild(chip);
-      last = m.index + m[0].length;
-    }
-    codeAndEmph(p, text.slice(last));
-  }
-
-  // A real path has word characters and no whitespace — this rejects the literal
-  // "..." written when quoting the directive syntax in prose.
-  function isPath(v) {
-    return /[A-Za-z0-9_]/.test(v) && !/\s/.test(v);
-  }
-
-  // Everywhere the pane should go, in the order the answer says to go there. An [[edit:]]
-  // counts: a proposed change is a place in the code, and the reader should not have to
-  // click anything to be shown the thing being discussed.
-  function allDirectives(text) {
-    const out = [];
-    // Blank inline code to the same LENGTH, so both scans index the same string and the
-    // sort below really is document order.
-    const bare = text.replace(/`[^`\n]+`/g, (q) => " ".repeat(q.length));
-    let m;
-    OPEN_RE.lastIndex = 0;
-    while ((m = OPEN_RE.exec(bare))) {
-      if (isPath(m[1])) out.push({ at: m.index, path: m[1], spec: m[2] || "" });
-    }
-    out.sort((a, b) => a.at - b.at);
-    return out;
-  }
-
-  // Chips are marked by WHERE THEY POINT, not by their position in the message. Two
-  // things walk this list -- the auto-follow and the narrator -- and they count
-  // differently (the narrator speaks over edits rather than stopping on them), so a
-  // numeric index quietly lit the wrong chip as soon as an edit preceded an open.
-  function chipKey(path, spec) { return path + "#" + (spec || ""); }
-
-  function markActiveChip(scope, key) {
-    const chips = scope.querySelectorAll(".chip");
-    let hit = null;
-    chips.forEach((c) => {
-      const on = key != null && c.dataset.key === key;
-      c.classList.toggle("active", on);
-      if (on) hit = c;
-    });
-    if (hit) {
-      const r = hit.getBoundingClientRect(), lr = logEl.getBoundingClientRect();
-      if (r.top < lr.top || r.bottom > lr.bottom) hit.scrollIntoView({ block: "nearest" });
-    }
-  }
-
-  function shortPath(p) {
-    const parts = p.split("/");
-    return parts.length > 2 ? ".../" + parts.slice(-2).join("/") : p;
-  }
-
-  function inline(parent, text) {
-    if (!text) return;
-    for (const bit of text.split(/(`[^`\n]+`)/)) {
-      if (!bit) continue;
-      if (bit.length > 2 && bit.startsWith("`") && bit.endsWith("`")) {
-        const c = document.createElement("code");
-        c.textContent = bit.slice(1, -1);
-        parent.appendChild(c);
-      } else parent.appendChild(document.createTextNode(bit));
-    }
-  }
-
-  // ---------------- chat ----------------
-  function bubble(who, cls) {
-    const m = document.createElement("div");
-    m.className = "msg " + (cls || "");
-    const w = document.createElement("div");
-    w.className = "who"; w.textContent = who;
-    const b = document.createElement("div");
-    b.className = "body";
-    m.append(w, b);
-    logEl.insertBefore(m, $("tailpad"));
-    return m;
-  }
-
-  // ---------------- changes ----------------
-  // The branch, read as a diff against where it grew from. This is the review surface, and
-  // since the agent works in a throwaway worktree it is the ONLY one: making a change is
-  // how a change gets proposed, so there is nothing to show that is not already here.
-  const CHG = "@changed/";
-  let chgItems = [];
-  let chgBase = "";
-  let chgSource = "";   // the checkout Finalize writes into; empty when there is no worktree
-  let chgAccept = false;
-
-  async function refreshChanges() {
-    let d = null;
-    try {
-      const [c, f] = await Promise.all([
-        fetch("/api/changes").then((r) => r.json()),
-        // The agent writes real files; the tree it was handed at boot does not know them.
-        fetch("/api/files").then((r) => r.json()).catch(() => null),
-      ]);
-      d = c;
-      if (f && f.files) allFiles = f.files;
-    } catch (e) { return; }
-    chgItems = d.items || [];
-    chgBase = d.base || "";
-    chgSource = d.source || "";
-    chgAccept = !!d.accept;
-    chgByPath = new Map(chgItems.map((e) => [e.path, e]));
-    renderTree();
-    await refreshOpenDiffs();
-    updateAllGood();
-  }
-
-  // The agent revising a file while its diff is open is the NORMAL case -- it is what
-  // happens every time a rejection gets answered. The view has to follow, or the reader is
-  // studying an argument that has already moved on. Marks look after themselves: a hunk the
-  // agent did not touch keeps its content hash and so keeps its decision, and only the one
-  // that was rewritten comes back unreviewed.
-  async function refreshOpenDiffs() {
-    for (const t of openTabs.filter((x) => x.chg)) {
-      const rel = realPath(t.path);
-      if (!chgByPath.has(rel)) continue;
-      let d = null;
-      try {
-        d = await fetch("/api/change?path=" + encodeURIComponent(rel)).then((r) => r.json());
-      } catch (e) { continue; }
-      if (!d || d.error || d.digest === t.data.digest) continue;
-      t.data = d;
-      if (t.path === active) {
-        const sc = $("scroll"), at = sc.scrollTop;
-        renderCode(t, false);
-        sc.scrollTop = at;
-      }
-    }
-    // A rejection box whose hunk no longer exists is pointing at code that is gone -- which
-    // is exactly what happens when the agent acts on the rejection.
-    const live = new Set();
-    for (const { hunk } of openHunks()) live.add(hunk.id);
-    const stale = refs.filter((r) => r.hunk && !live.has(r.hunk));
-    if (stale.length) {
-      for (const r of stale) review.delete(r.hunk);
-      refs = refs.filter((r) => !r.hunk || live.has(r.hunk));
-      renderRefs();
-    }
-  }
-
-  // The one thing in this page that changes something outside the worktree. Finalize has
-  // already decided whether it should run; this just does it.
-  async function acceptChanges() {
-    if (!chgItems.length) return;
-    const btn = $("allGood");
+  async function send() {
+    const n = comments.length + verdicts.size + ($("general").value.trim() ? 1 : 0);
+    if (!n && !confirm("Send an empty review?\n\nNo verdict and no comment on anything —\nwhich tells the agent very little.")) return;
+    // Catching a skipped change here is worth more than reporting it afterwards: you are
+    // still in front of it, and one keypress fixes it.
+    const open = walk().filter((it) => !verdictOf(it.key));
+    if (open.length && !confirm(
+        open.length + " change" + (open.length === 1 ? "" : "s")
+        + " still have no verdict:\n\n  "
+        + open.slice(0, 12).map((it) => (it.kind === "stop" ? "stop " + it.s.n + " — " : "")
+                                        + it.label + (it.at ? ":" + it.at : "")).join("\n  ")
+        + (open.length > 12 ? "\n  … and " + (open.length - 12) + " more" : "")
+        + "\n\nSend anyway?")) return;
+    const btn = $("send");
     btn.disabled = true;
+    btn.textContent = "Sending…";
     let res = null;
     try {
-      res = await fetch("/api/accept", { method: "POST" }).then((r) => r.json());
-    } catch (e) {
-      btn.disabled = false; flash("Could not reach the server."); return;
-    }
-    btn.disabled = false;
-    if (!res.ok) {
-      flash(res.blocked ? "Not written — " + res.blocked.join(", ") + " " + res.error
-                        : (res.error || "Could not write the changes."));
-      return;
-    }
-    const n = res.restored.length + res.deleted.length;
-    flash(n + " path(s) written into " + res.source + " as uncommitted changes");
-    btn.textContent = "Finalize Changes";
-    for (const t of openTabs.slice()) if (t.path.startsWith(CHG)) closeTab(t.path);
-    refreshChanges();
-  }
-
-  // An [[edit:]] block, which nothing is supposed to emit any more: the agent works in a
-  // worktree, so making a change IS proposing it and the Changes view is where it is read.
-  // Rendered rather than dropped, because silently swallowing code it wrote would be worse.
-  function strayEdit(path, start, end, replacement) {
-    const box = document.createElement("div");
-    box.className = "diff";
-    const head = document.createElement("div");
-    head.className = "head";
-    head.textContent = shortPath(path) + " \u00b7 lines " + start + "\u2013" + end
-                     + " \u00b7 not applied";
-    const pre = document.createElement("pre");
-    for (const l of replacement.split("\n")) {
-      const d = document.createElement("div");
-      d.className = "d plus"; d.textContent = l;
-      pre.appendChild(d);
-    }
-    box.append(head, pre);
-    return box;
-  }
-
-  // ---------------- reviewing hunk by hunk ----------------
-  // One decision per hunk, held here and nowhere else: nothing is written to the user's
-  // repo until Finalize. That is what makes un-accepting free -- it is unmarking, not
-  // undoing. The key is the hunk's content hash, so the moment the agent rewrites a hunk
-  // its id changes and any mark on the old one falls away instead of quietly transferring
-  // to code nobody looked at.
-  const review = new Map();   // hunk id -> "accept" | "reject"
-
-  function rowHunks(t) {
-    const out = new Array(t.data.lines.length).fill(null);
-    for (const h of (t.data.hunks || [])) {
-      for (let i = h.at; i < h.at + h.rows && i < out.length; i++) out[i] = h;
-    }
-    return out;
-  }
-
-  // Every hunk on screen right now, with the file it belongs to.
-  function openHunks() {
-    const out = [];
-    for (const t of openTabs) {
-      for (const h of (t.data.hunks || [])) out.push({ tab: t, hunk: h });
-    }
-    return out;
-  }
-
-  function hunkLabel(t, h) {
-    return shortPath(realPath(t.path)) + ":" + h.line;
-  }
-
-  function hunkBar(t, h) {
-    const st = review.get(h.id) || "";
-    const bar = document.createElement("div");
-    bar.className = "hbar" + (st ? " " + st : "");
-    // Everything lives in the sticky group, not in the band: the band is only the divider.
-    const grp = document.createElement("span");
-    grp.className = "grp";
-    bar.appendChild(grp);
-    const lbl = document.createElement("span");
-    lbl.className = "l";
-    lbl.textContent = st === "accept" ? "accepted" : st === "reject" ? "rejected"
-                    : "−" + h.removed + " +" + h.added;
-    grp.appendChild(lbl);
-
-    if (st) {
-      const undo = document.createElement("button");
-      undo.className = "hb";
-      undo.textContent = "undo";
-      undo.onclick = () => setReview(t, h, null);
-      grp.appendChild(undo);
-    } else {
-      const ok = document.createElement("button");
-      ok.className = "hb ok"; ok.textContent = "✓ accept";
-      ok.onclick = () => setReview(t, h, "accept");
-      const no = document.createElement("button");
-      no.className = "hb no"; no.textContent = "✗ reject";
-      no.onclick = () => setReview(t, h, "reject");
-      grp.append(ok, no);
-    }
-    return bar;
-  }
-
-  function setReview(t, h, state) {
-    const was = review.get(h.id) || null;
-    if (state) review.set(h.id, state); else review.delete(h.id);
-    if (was === "reject" && state !== "reject") dropRejectRef(h.id);
-    if (state === "reject") addRejectRef(t, h);
-    // renderCode rebuilds the pane and restores the tab's REMEMBERED scroll, which is not
-    // where the reader is standing. Deciding on a hunk must not move the page out from
-    // under the button that was just pressed.
-    const sc = $("scroll"), at = sc.scrollTop;
-    renderCode(t, false);
-    sc.scrollTop = at;
-    renderTree();
-    updateAllGood();
-  }
-
-  // A rejected hunk becomes exactly what Ctrl-L produces: a box over the composer holding
-  // the code and where it is, so the note you type next to it can be two words. Reject one
-  // and say why, or reject five and answer them all in one message.
-  function addRejectRef(t, h) {
-    const path = realPath(t.path);
-    if (refs.some((r) => r.hunk === h.id)) return;
-    const body = [];
-    for (let i = h.at; i < h.at + h.rows; i++) {
-      const mk = t.data.marks[i];
-      body.push((mk === "del" ? "- " : mk === "add" ? "+ " : "  ")
-                + t.data.lines[i].map((x) => x.t).join(""));
-    }
-    refs.push({ path: path, a: h.line, b: h.line + Math.max(0, h.added - 1),
-                text: body.join("\n"), clipped: false, hunk: h.id, reject: true });
-    renderRefs();
-    boxEl.focus();
-  }
-
-  function dropRejectRef(id) {
-    const i = refs.findIndex((r) => r.hunk === id);
-    if (i >= 0) { refs.splice(i, 1); renderRefs(); }
-  }
-
-  // Finalize is the only thing that writes. It refuses while a rejection is outstanding --
-  // a rejection is feedback that has not been sent, and shipping the code anyway would make
-  // the button a lie -- and it asks first if anything was never looked at.
-  function reviewState() {
-    const all = openHunks();
-    const known = new Set();
-    const unseen = [], rejected = [];
-    for (const { tab, hunk } of all) {
-      if (known.has(hunk.id)) continue;
-      known.add(hunk.id);
-      const st = review.get(hunk.id);
-      if (st === "reject") rejected.push(hunkLabel(tab, hunk));
-      else if (!st) unseen.push(hunkLabel(tab, hunk));
-    }
-    return { unseen: unseen, rejected: rejected };
-  }
-
-  function updateAllGood() {
-    const btn = $("allGood");
-    if (!btn) return;
-    btn.hidden = !chgItems.length || !chgAccept;
-    const n = refs.filter((r) => r.reject).length;
-    btn.textContent = n ? "Finalize (" + n + " rejected)" : "Finalize Changes";
-    btn.classList.toggle("warn", n > 0);
-  }
-
-  async function allGood() {
-    const st = reviewState();
-    if (st.rejected.length) {
-      flash("Not written — " + st.rejected.join(", ") + " still rejected. "
-            + "Send your feedback, or undo the rejection.");
-      return;
-    }
-    // Files opened tab by tab are the only ones whose hunks we know about; anything never
-    // opened has simply not been looked at, and saying so is more honest than assuming.
-    const opened = new Set(openTabs.map((t) => realPath(t.path)));
-    const never = chgItems.map((e) => e.path).filter((p) => !opened.has(p));
-    const un = st.unseen.concat(never.map((p) => p + " (never opened)"));
-    if (un.length && !confirm("Not reviewed yet:\n\n  " + un.join("\n  ")
-                              + "\n\nWrite everything anyway?")) return;
-    await acceptChanges();
-    review.clear();
-  }
-
-  function setupChanges() {
-    $("allGood").onclick = allGood;
-    // While an answer is streaming the agent is writing files, and the point of the list
-    // is to show the state it is in NOW. Both endpoints behind this are cached server-side
-    // (2s for the diff, 5s for the tree), so a poll this slow costs essentially nothing.
-    setInterval(() => { if (busy) refreshChanges(); }, 3000);
-    refreshChanges();
-  }
-
-  // ---------------- cells ----------------
-  // Each exchange is a cell. A new answer is pinned near the TOP of the viewport, not the
-  // bottom, so reading starts immediately and the text fills in below rather than pushing
-  // the eye down the page. TOP_FRAC of the pane is left above it so the question stays visible.
-  const TOP_FRAC = 0.18;
-
-  function cells() { return Array.from(logEl.querySelectorAll(".msg.cell")); }
-
-  // The last cell can only be pulled up if there is something under it to scroll into.
-  function sizePad() {
-    const c = cells();
-    const last = c[c.length - 1];
-    const pad = $("tailpad");
-    if (!last) { pad.style.height = "0px"; return; }
-    const room = logEl.clientHeight * (1 - TOP_FRAC) - last.offsetHeight;
-    pad.style.height = Math.max(0, room) + "px";
-  }
-
-  // The pin is HELD, not applied once: an answer that is still being written (or has not
-  // started arriving yet) changes height constantly, and a single scrollTop assignment at
-  // the wrong moment silently clamps. Re-asserting on every frame of growth is what makes
-  // "click Continue while it is still thinking" land in the right place.
-  let pinTarget = null, pinHeld = false, cellIdx = -1;
-
-  function holdPin(msg) {
-    pinTarget = msg;
-    pinHeld = true;
-    applyPin();
-  }
-
-  function applyPin() {
-    if (!pinHeld || !pinTarget || !pinTarget.isConnected) return;
-    sizePad();
-    const delta = pinTarget.getBoundingClientRect().top - logEl.getBoundingClientRect().top;
-    logEl.scrollTop += delta - logEl.clientHeight * TOP_FRAC;
-  }
-
-  function releasePin() { pinHeld = false; }
-
-  function atLatest() {
-    const c = cells();
-    if (!c.length) return true;
-    const last = c[c.length - 1];
-    const top = last.getBoundingClientRect().top - logEl.getBoundingClientRect().top;
-    return top < logEl.clientHeight * 0.75;
-  }
-
-  function updateJump() {
-    $("jumpDown").hidden = atLatest();
-  }
-
-  function gotoCell(i) {
-    const c = cells();
-    if (!c.length) return;
-    cellIdx = Math.max(0, Math.min(c.length - 1, i));
-    const m = c[cellIdx];
-    holdPin(m);
-    releasePin();                 // a deliberate jump is a destination, not a follow
-    m.classList.add("jumped");
-    setTimeout(() => m.classList.remove("jumped"), 400);
-    syncCellNav();
-    updateJump();
-  }
-
-  function syncCellNav() {
-    const n = cells().length;
-    $("cellPrev").disabled = !(n && cellIdx > 0);
-    $("cellNext").disabled = !(n && cellIdx < n - 1);
-  }
-
-  function setupCells() {
-    $("cellPrev").onclick = () => gotoCell(cellIdx - 1);
-    $("cellNext").onclick = () => gotoCell(cellIdx + 1);
-    $("jumpDown").onclick = () => gotoCell(cells().length - 1);
-    // Only real input releases the pin — never our own scrollTop writes.
-    for (const ev of ["wheel", "touchmove", "mousedown"]) {
-      logEl.addEventListener(ev, releasePin, { passive: true });
-    }
-    logEl.addEventListener("scroll", updateJump, { passive: true });
-    window.addEventListener("keydown", (e) => {
-      if (e.altKey && !e.ctrlKey && !e.metaKey) {
-        if (e.key === "ArrowUp") { e.preventDefault(); gotoCell(cellIdx - 1); return; }
-        if (e.key === "ArrowDown") { e.preventDefault(); gotoCell(cellIdx + 1); return; }
-      }
-      if (document.activeElement === logEl && /^(Arrow|Page|Home|End)/.test(e.key)) releasePin();
-    });
-    window.addEventListener("resize", () => { sizePad(); applyPin(); updateJump(); });
-    syncCellNav();
-    updateJump();
-  }
-
-  // The answer arrives whole, split into parts by [[continue: ...]]. The button walks
-  // through what is already written -- no second call, nothing to guess, and the reader
-  // sets the pace instead of the model.
-  function addContinue(msg, label, onclick) {
-    const bar = document.createElement("div");
-    bar.className = "contbar";
-    const btn = document.createElement("button");
-    btn.className = "contbtn";
-    const cap = document.createElement("span");
-    cap.textContent = "Continue";
-    btn.appendChild(cap);
-    if (label) {
-      const nx = document.createElement("span");
-      nx.className = "next";
-      nx.textContent = "\u2192 " + label;
-      btn.appendChild(nx);
-    }
-    btn.dataset.label = label || "";
-    btn.onclick = onclick;
-    const hint = document.createElement("span");
-    hint.className = "kbd";
-    hint.textContent = "or press Enter";
-    bar.append(btn, hint);
-    msg.appendChild(bar);
-    sizePad();      // the button is part of the cell; never yank the view to it
-    applyPin();
-  }
-
-  // The "who" label doubles as the cell heading once a title arrives.
-  function setCellTitle(msg, title) {
-    if (!title || msg.dataset.title === title) return;
-    msg.dataset.title = title;
-    const w = msg.querySelector(".who");
-    w.textContent = title;
-    w.classList.add("titled");
-  }
-
-  function pendingContinue() {
-    const bars = logEl.querySelectorAll(".contbar .contbtn");
-    return bars.length ? bars[bars.length - 1] : null;
-  }
-
-  function setBusy(on, label) {
-    busy = on; sendEl.disabled = on;
-    $("status").classList.toggle("busy", on);
-    $("stState").textContent = label || (on ? "thinking" : "ready");
-  }
-
-  // ---------------- narration ----------------
-  // The chat is read aloud while the center pane follows the voice, not the stream:
-  // an [[open:...]] fires the moment speech reaches the spot in the sentence where it
-  // was written, which is how a person points at code while talking about it.
-  const synth = window.speechSynthesis || null;
-  let narrOn = localStorage.getItem("cw.voice") === "1";
-  // Quarter steps, so the slider lands on a speed you can name rather than on 1.13.
-  const RATE_STEP = 0.25, RATE_MIN = 0.5, RATE_MAX = 2;
-  const snapRate = (v) => Math.min(RATE_MAX, Math.max(RATE_MIN,
-                            Math.round(v / RATE_STEP) * RATE_STEP));
-  let narrRate = snapRate(Number(localStorage.getItem("cw.rate")) || 1);
-  let narrVoice = null;
-  let narrQ = [];          // queued {say, fire, idx, scope}
-  let narrBusy = false;
-  let narrToken = 0;       // bumped on every stop; stale callbacks check it
-  let narrCurrent = null;  // the chunk in the speaker's mouth, so a rate change can repeat it
-
-  const VOICE_RANK = ["ryan", "lessac", "piper", "google us english", "microsoft aria", "samantha",
-                      "english (america)", "en-us", "english"];
-  function pickVoice() {
-    if (!synth) return;
-    const vs = synth.getVoices().filter((v) => /^en/i.test(v.lang));
-    if (!vs.length) return;
-    const want = localStorage.getItem("cw.voiceName");
-    narrVoice = vs.find((v) => v.name === want) ||
-      VOICE_RANK.map((k) => vs.find((v) => (v.name + " " + v.lang).toLowerCase().includes(k)))
-                .find(Boolean) || vs[0];
-  }
-  if (synth) { pickVoice(); synth.onvoiceschanged = pickVoice; }
-
-  // Two engines. When the server has Piper, sentences are synthesized server-side and
-  // played as audio, and the NEXT ones are synthesized while the current one plays --
-  // that lookahead is what removes the silence between sentences. Without Piper it
-  // falls back to the browser's own speechSynthesis, which cannot be run ahead.
-  let ttsOK = false;
-  const audioEl = new Audio();
-  const AHEAD = 3;
-  // A failed synthesis used to set ttsOK = false for good, so one hiccup -- a server
-  // restarted under an open tab, say -- silently moved the rest of the answer onto the
-  // browser's own speech engine, mid-paragraph, at a different speed and in a different
-  // voice. Now a failure costs that one sentence its retry, and the server is tried
-  // again for the next; only a run of them gives up, and then it says so.
-  let ttsFails = 0;
-  const TTS_GIVE_UP = 3;
-  // Whether this server HAS Piper, as opposed to whether it is answering right now.
-  // If it has it, a failure is transient and the answer is to wait, not to switch
-  // engines mid-paragraph: on this machine the browser's own speech also routes to
-  // Piper through speech-dispatcher, so the fallback sounds like the same voice
-  // coming apart rather than like a different one. The queue is held instead.
-  let ttsServer = false;
-  let narrHeld = false;
-
-  // Chrome refuses audio.play() until the page has been clicked, and a reload with
-  // Voice already on has no click yet. The old speechSynthesis path was never gated
-  // this way, so this has to be handled rather than assumed: a refusal must not eat
-  // the sentence -- it goes back on the queue and waits for the first gesture.
-  let narrBlocked = false;
-  function narrUnblock() {
-    if (!narrBlocked) return;
-    narrBlocked = false;
-    voiceBtn.classList.remove("wants");
-    setVoiceBtn();
-    narrPump();
-  }
-  for (const ev of ["pointerdown", "keydown"]) {
-    document.addEventListener(ev, narrUnblock, true);
-  }
-
-  function narrDrop(it) {
-    if (it.ctrl) { try { it.ctrl.abort(); } catch (e) {} }
-    if (it.url) { URL.revokeObjectURL(it.url); it.url = null; }
-    for (const t of it.timers || []) clearTimeout(t);
-    it.timers = null;
-    it.ctrl = null; it.wav = null;
-  }
-
-  // Light the chips this sentence points at: the first one as it starts, the rest
-  // scheduled against the audio's own duration.
-  function narrMarks(it, duration) {
-    it.timers = [];
-    for (const mk of it.marks || []) {
-      const at = duration && mk.frac > 0.02 ? duration * mk.frac : 0;
-      if (!at) { mk.fire(); continue; }
-      it.timers.push(setTimeout(mk.fire, at * 1000));
-    }
-  }
-
-  function narrStop() {
-    narrToken++;
-    for (const it of narrQ) narrDrop(it);
-    if (narrCurrent) narrDrop(narrCurrent);
-    narrQ = [];
-    narrBusy = false;
-    narrCurrent = null;
-    narrHeld = false;
-    audioEl.pause();
-    audioEl.removeAttribute("src");
-    if (synth) synth.cancel();
-  }
-
-  function narrEnqueue(items) {
-    if (!narrOn || !items.length) return;
-    for (const it of items) narrQ.push(it);
-    narrAhead();
-    narrPump();
-  }
-
-  // Start synthesis for the next few queued sentences. The rate is baked into the
-  // audio, so anything fetched at a stale rate is thrown away when the slider moves.
-  function narrAhead() {
-    if (!ttsOK) return;
-    let n = 0;
-    for (const it of narrQ) {
-      if (n++ >= AHEAD) break;
-      narrSynth(it);
-    }
-  }
-
-  function narrSynth(it) {
-    if (!it.say || it.wav) return;
-    it.rate = narrRate;
-    it.ctrl = new AbortController();
-    const ctrl = it.ctrl;
-    it.wav = fetch("/api/tts", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: it.say, rate: it.rate }), signal: ctrl.signal,
-    }).then((r) => (r.ok ? r.blob() : null)).catch(() => null);
-  }
-
-  function narrPump() {
-    if (narrBusy || narrBlocked || narrHeld || !narrQ.length) return;
-    const it = narrQ.shift();
-    if (!it.say) {                       // a directive with nothing to say around it
-      narrMarks(it, 0);
-      narrPump();
-      return;
-    }
-    narrBusy = true;
-    narrCurrent = it;
-    const tok = narrToken;
-    const next = () => {
-      if (tok !== narrToken) return;     // a stop happened while we were talking
-      narrDrop(it);
-      narrBusy = false;
-      narrCurrent = null;
-      narrPump();
-    };
-    narrAhead();
-
-    if (ttsOK) {
-      narrSynth(it);
-      it.wav.then((blob) => {
-        if (tok !== narrToken) return;
-        if (!blob) {
-          if (!it.retried) {                 // one hiccup: ask again for this sentence
-            it.retried = true;
-            it.wav = null;
-            narrQ.unshift(it);
-            narrBusy = false;
-            narrCurrent = null;
-            narrPump();
-            return;
-          }
-          if (++ttsFails >= TTS_GIVE_UP) {
-            if (ttsServer) {          // it has Piper; hold the queue until it answers
-              narrQ.unshift(it);
-              it.wav = null;
-              it.retried = false;
-              narrBusy = false;
-              narrCurrent = null;
-              narrHeld = true;
-              setVoiceBtn();
-              flash("voice: the server stopped answering — click Voice to retry");
-              return;
-            }
-            ttsOK = false;            // no Piper here at all: the browser is all there is
-            setVoiceBtn();
-            flash("voice: the server stopped answering");
-          }
-          next();
-          return;
-        }
-        ttsFails = 0;
-        it.url = URL.createObjectURL(blob);
-        audioEl.src = it.url;
-        audioEl.playbackRate = 1;
-        audioEl.onended = next;
-        audioEl.onerror = next;
-        audioEl.onloadedmetadata = () => {
-          if (tok !== narrToken || it.timers) return;
-          narrMarks(it, isFinite(audioEl.duration) ? audioEl.duration : 0);
-        };
-        audioEl.play().catch((err) => {
-          if (tok !== narrToken) return;
-          if (err && err.name === "NotAllowedError") {
-            narrQ.unshift(it);          // hold the sentence, do not skip it
-            for (const t of it.timers || []) clearTimeout(t);
-            it.timers = null;           // the chips will be lit again on the retry
-            narrBusy = false;
-            narrCurrent = null;
-            narrBlocked = true;
-            voiceBtn.classList.add("wants");
-            setVoiceBtn();
-            flash("click the page to start the voice");
-            return;
-          }
-          next();
-        });
-      });
-      return;
-    }
-    if (!synth) { next(); return; }
-    const u = new SpeechSynthesisUtterance(it.say);
-    if (narrVoice) { u.voice = narrVoice; u.lang = narrVoice.lang; }
-    u.rate = narrRate;
-    u.onboundary = (e) => {              // speechSynthesis does report progress
-      const frac = e.charIndex / Math.max(1, it.say.length);
-      for (const mk of it.marks || []) {
-        if (!mk.done && frac >= mk.frac) { mk.done = true; mk.fire(); }
-      }
-    };
-    u.onstart = () => {                  // whatever sits at the very start of it
-      for (const mk of it.marks || []) {
-        if (mk.frac <= 0.02 && !mk.done) { mk.done = true; mk.fire(); }
-      }
-    };
-    u.onend = next;
-    u.onerror = next;
-    synth.speak(u);
-  }
-
-  // ONE definition of where a spoken unit ends, used by both the splitter and the
-  // stable-prefix cut. They have to agree exactly: if the prefix could end anywhere
-  // the splitter does not also split, a unit would be short in one pass and whole in
-  // the next, the chunk count would not grow, and the text in between would be lost.
-  const UNIT_END = /[.!?]+[)"'”]*(?=\s|$)|\n\n/g;
-
-  function narrUnits(text) {
-    const out = [];
-    let last = 0, m;
-    UNIT_END.lastIndex = 0;
-    while ((m = UNIT_END.exec(text))) {
-      out.push(text.slice(last, m.index + m[0].length));
-      last = UNIT_END.lastIndex;
-    }
-    if (last < text.length) out.push(text.slice(last));
-    return out;
-  }
-
-  // The start of the unit that contains `at`.
-  function unitStart(text, at) {
-    let start = 0, m;
-    UNIT_END.lastIndex = 0;
-    while ((m = UNIT_END.exec(text)) && UNIT_END.lastIndex <= at) start = UNIT_END.lastIndex;
-    return start;
-  }
-
-  // Where it is safe to stop reading a half-written answer: the end of the last
-  // complete unit, never inside an unfinished fence, edit block or directive.
-  function narrStable(text) {
-    let cut = text.length;
-    for (const open of ["```", "[[edit:"]) {
-      const i = text.lastIndexOf(open);
-      if (i !== -1) {
-        const close = open === "```" ? text.indexOf("```", i + 3) : text.indexOf("[[/edit]]", i);
-        if (close === -1) cut = Math.min(cut, i);
-      }
-    }
-    const bracket = text.lastIndexOf("[[");
-    if (bracket !== -1 && text.indexOf("]]", bracket) === -1) cut = Math.min(cut, bracket);
-    const head = text.slice(0, cut);
-    let end = 0, m;
-    UNIT_END.lastIndex = 0;
-    while ((m = UNIT_END.exec(head))) end = UNIT_END.lastIndex;
-    let stable = head.slice(0, end);
-    // Never end a pass on a directive. Its label is spoken with the words that follow,
-    // so a cut between them makes the label a chunk of its own in this pass and part of
-    // the next chunk in the following one -- the count does not grow, and the sentence
-    // after the directive is never spoken. A directive alone on its own line, which is
-    // how a step usually points at the code it is about to discuss, hits this every time.
-    const trimmed = stable.replace(/\s+$/, "");
-    if (trimmed.endsWith("]]")) {
-      const open = trimmed.lastIndexOf("[[");
-      if (open !== -1) stable = stable.slice(0, open);
-    }
-    // A sentence followed by [[say: ...]] must never be spoken in its written form.
-    // The directive sits after the full stop, so it falls outside the prefix that ends
-    // there: take it in when it is complete, and wait when it might still be coming.
-    const rawRest = text.slice(stable.length);
-    const rest = rawRest.replace(/^\s+/, "");
-    const gap = rawRest.length - rest.length;
-    const dropLast = () => stable.slice(0, unitStart(stable, stable.length - 1));
-    if (rest.startsWith("[[say:")) {
-      const close = rest.indexOf("]]");
-      return close === -1 ? dropLast() : text.slice(0, stable.length + gap + close + 2);
-    }
-    // Nothing yet, or only the few characters that could still become "[[say:".
-    if (rest === "" || /^(\[(\[(s(a(y(:)?)?)?)?)?)$/.test(rest)) return dropLast();
-    return stable;
-  }
-
-  const NARR_DROP = /\[\[[^\]]*\]\]/g;
-
-  // Written for the eye, said for the ear. "(bv, n+v, d)" is fine on screen and
-  // unbearable spoken, so the shapes and operators that show up constantly in this
-  // kind of prose are turned into the words a person would actually say. This is the
-  // safety net: the model is also told to phrase things for listening, but it will
-  // always reach for symbols sometimes, and the reader should not have to suffer them.
-  const SHAPE = /\(([^()\n]{1,60})\)/g;          // a parenthesised tuple, maybe a shape
-  const SHAPEY = /^[\w\s,+*/\-]+$/;               // ...only if it is all symbols and names
-
-  // A character espeak-ng has no name for is read as its CODEPOINT: the transpose
-  // mark in QK\u1d40 comes out as "letter one D four zero", and a sentence with a few of
-  // those turns into a fast stream of letters and digits -- which is what "the voice
-  // suddenly sped up and became babble" actually was. Nothing gets past this: the
-  // compatibility forms are normalized to their plain letters, the symbols worth saying
-  // are said, and anything left that is not plainly sayable is dropped.
-  const SYMBOLS = [
-    [/[\u2018\u2019]/g, "'"], [/[\u201c\u201d]/g, '"'],
-    [/[\u2014\u2013\u2012]/g, ", "], [/\u00b7/g, " "], [/\u2026/g, "..."],
-    [/\u2207/g, " grad "], [/\u2202/g, " partial "], [/\u222b/g, " integral "],
-    [/\u2211/g, " sum "], [/\u220f/g, " product "], [/\u221e/g, " infinity "],
-    [/\u2208/g, " in "], [/\u2209/g, " not in "], [/\u2200/g, " for all "],
-    [/\u2203/g, " there exists "], [/[\u2225\u2016]/g, " norm "], [/\u2299/g, " elementwise times "],
-    [/\u2297/g, " tensor product "], [/\u21d2/g, " implies "], [/\u2261/g, " identical to "],
-    [/\u2192/g, " to "], [/\u2190/g, " from "], [/\u2194/g, " to and from "],
-    [/\u221d/g, " proportional to "], [/\u226a/g, " much less than "],
-    [/\u226b/g, " much greater than "], [/[\u27e8\u27e9]/g, " "],
-  ];
-  // Latin, Greek and the punctuation espeak can actually pronounce. Everything else goes.
-  const UNSAYABLE = /[^\u0000-\u024f\u0370-\u03ff\u1e00-\u1eff\u221a\u2248\u2260\u2264\u2265\u00d7\u00f7\u00b1]/g;
-
-  const SAY = [
-    [/\s*(?:->|→|=>)\s*/g, " to "],
-    [/\s*==\s*/g, " equals "],
-    [/\s*!=\s*/g, " is not "],
-    [/\s*>=\s*/g, " at least "],
-    [/\s*<=\s*/g, " at most "],
-    [/(\w)\s*=\s*(\w)/g, "$1 equals $2"],
-    [/(\w)\s*\+\s*(\w)/g, "$1 plus $2"],
-    [/(\w)\s*\*\s*(\w)/g, "$1 times $2"],
-    [/(\d)\s*[x\u00d7]\s*(\d)/g, "$1 by $2"],
-    [/(\w)\s*\|\s*(\w)/g, "$1 or $2"],
-  ];
-
-  function speechify(s) {
-    s = s.normalize("NFKC");                  // superscripts and the like become letters
-    for (const [re, to] of SYMBOLS) s = s.replace(re, to);
-    s = s.replace(UNSAYABLE, " ");
-    s = s.replace(SHAPE, (m, inner) => {
-      if (!inner.includes(",") || !SHAPEY.test(inner)) return m;
-      // A shape is read the way it is said out loud: b by n by d, not b comma n comma d.
-      return " " + inner.split(",").map((t) => t.trim()).filter(Boolean).join(" by ") + " ";
-    });
-    for (const [re, to] of SAY) s = s.replace(re, to);
-    return s;
-  }
-
-  function narrClean(s) {
-    return speechify(s.replace(NARR_DROP, " ")
-            .replace(/`([^`\n]+)`/g, "$1")
-            .replace(/\*\*([^*\n]+)\*\*/g, "$1")
-            .replace(/\*([^*\n]+)\*/g, "$1"))
-            .replace(/\s+([,.;:!?])/g, "$1")
-            .replace(/\s+/g, " ")
-            .trim();
-  }
-
-  // Split the answer into speakable chunks: one sentence each, with the chips that
-  // fall inside it and how far through the words each one sits.
-  //
-  // A chip is not punctuation -- it is the words the sentence uses at that point, so
-  // the label is spoken inline and the sentence stays one utterance. Speaking the
-  // label separately is what made the voice sound strange: Piper gives every request
-  // sentence-final intonation and a pause, so "the primary path, with" landed like a
-  // finished sentence and the label after it started a new one.
-  function narrChunks(text, scope) {
-    text = text.replace(CONT_G, "").replace(TITLE_RE, "");
-    text = text.replace(EDIT_RE, (m, p) => " Proposing an edit to " + shortPath(p) + ". ");
-    text = text.replace(FENCE_RE, " (code block in the chat.) ");
-
-    // Substitute each directive with the words it shows, remembering where the chip
-    // lands in the resulting prose.
-    const spans = codeSpans(text);
-    let prose = "", last = 0, m;
-    const marks = [];
-    OPEN_RE.lastIndex = 0;
-    while ((m = OPEN_RE.exec(text))) {
-      if (!isPath(m[1])) continue;
-      if (spans.some(([a, b]) => m.index >= a && m.index + m[0].length <= b)) continue;
-      prose += text.slice(last, m.index);
-      marks.push({ at: prose.length, path: m[1], spec: m[2] || "",
-                   key: chipKey(m[1], m[2] || "") });
-      prose += (m[3] || "").replace(/`/g, "").trim();
-      last = m.index + m[0].length;
-    }
-    prose += text.slice(last);
-
-    // [[say: ...]] replaces the sentence it follows, in the ear only. Chips inside
-    // that sentence keep their place by moving to the start of the spoken version --
-    // the words no longer line up, but the code they point at still does.
-    SAY_RE.lastIndex = 0;
-    let sm;
-    while ((sm = SAY_RE.exec(prose))) {
-      // The directive usually comes after the sentence's full stop, which puts it in a
-      // unit of its own; the sentence it replaces is then the one before.
-      let from = unitStart(prose, sm.index);
-      if (!prose.slice(from, sm.index).trim() && from > 0) from = unitStart(prose, from - 1);
-      const said = " " + sm[1].trim() + " ";
-      const delta = said.length - (sm.index + sm[0].length - from);
-      for (const k of marks) {
-        if (k.at >= from && k.at < sm.index + sm[0].length) k.at = from;
-        else if (k.at >= sm.index + sm[0].length) k.at += delta;
-      }
-      prose = prose.slice(0, from) + said + prose.slice(sm.index + sm[0].length);
-      SAY_RE.lastIndex = from + said.length;
-    }
-
-    const fireFor = (k) => () => {
-      openFile(k.path, k.spec);
-      if (scope.el) markActiveChip(scope.el, k.key);
-    };
-
-    // One chunk per unit, and never more than one: this list has to be a stable PREFIX
-    // as the answer streams in, because the queue is advanced by counting what has
-    // already been sent. Merge two units and a sentence that stood alone in one pass
-    // vanishes into its neighbour in the next, taking the text between them with it.
-    const out = [];
-    let pos = 0;
-    for (const unit of narrUnits(prose)) {
-      const start = pos, end = pos + unit.length;
-      pos = end;
-      const mine = marks.filter((k) => k.at >= start && k.at < end);
-      const say = narrClean(unit);
-      if (!say) {
-        for (const k of mine) out.push({ say: "", marks: [{ frac: 0, fire: fireFor(k) }] });
-        continue;
-      }
-      out.push({
-        say: say,
-        // Where in the audio each chip belongs, as a fraction of the sentence. Piper
-        // reports no word timings, so this is proportional to characters -- close
-        // enough that the pane moves on the phrase that names it.
-        marks: mine.map((k) => ({ frac: (k.at - start) / unit.length, fire: fireFor(k) })),
-      });
-    }
-    return out;
-  }
-
-  // Every finished answer keeps its raw text, so it can be read aloud again later.
-  function addReplay(acts, msg, out) {
-    if (!synth || acts.querySelector(".replay")) return;
-    const b = document.createElement("button");
-    b.className = "act replay";
-    b.title = "Read this step aloud";
-    b.textContent = "\u25b6 listen";
-    b.onclick = () => narrReplay(out, msg.dataset.raw || "");
-    acts.appendChild(b);
-  }
-
-  // A live answer: feed whatever has become stable since the last call.
-  function narrFeed(state, acc, el, final) {
-    if (!narrOn) return;
-    state.raw = acc;
-    state.el = el;
-    const src = final ? acc : narrStable(acc);
-    if (!src) return;
-    const chunks = narrChunks(src, state);
-    if (chunks.length <= state.sent) return;
-    narrEnqueue(chunks.slice(state.sent));
-    state.sent = chunks.length;
-  }
-
-  function narrReplay(el, raw) {
-    narrStop();
-    if (!synth) return;
-    const state = { raw: raw, el: el, sent: 0 };
-    narrOn = true; setVoiceBtn();
-    narrEnqueue(narrChunks(raw, state));
-  }
-
-  // Model picker. A change lands on the next turn: the session is resumed, so the
-  // conversation so far is kept and only the model answering it changes.
-  const modelEl = $("model");
-  function setupModel(cur, list) {
-    for (const m of list || []) {
-      const o = document.createElement("option");
-      o.value = m; o.textContent = m;
-      modelEl.appendChild(o);
-    }
-    modelEl.value = cur || "";
-    modelEl.onchange = async () => {
-      const want = modelEl.value;
-      try {
-        const r = await fetch("/api/model", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ model: want }),
-        });
-        const j = await r.json();
-        if (!j.ok) throw new Error(j.error || "rejected");
-        flash(want + " from the next question");
-      } catch (e) {
-        flash("could not switch model");
-      }
-    };
-  }
-
-  // A test hook: the page is one closure, so an automated check of the narrator has
-  // no other way to see whether a sentence was held or dropped.
-  window.__cw = {
-    narr: () => ({
-      on: narrOn, blocked: narrBlocked, busy: narrBusy, queued: narrQ.length,
-      rate: narrRate, tts: ttsOK, playing: !audioEl.paused,
-      at: audioEl.currentTime, say: narrCurrent ? narrCurrent.say : null,
-    }),
-  };
-
-  const voiceBtn = $("voice"), rateEl = $("rate"), rateWrap = $("rateWrap");
-  function setVoiceBtn() {
-    voiceBtn.textContent = narrBlocked ? "Voice: click to start"
-                         : !narrOn ? "Voice: off"
-                         : narrHeld ? "Voice: retry"
-                         : ttsOK ? "Voice: on"
-                         : "Voice: browser";      // no Piper here; the browser is speaking
-    voiceBtn.title = narrHeld
-      ? "The voice server stopped answering. Click to pick up where it stopped."
-      : narrOn && !ttsOK
-      ? "This server has no Piper, so this is the browser's own speech engine"
-      : "Read the answers aloud and move the editor in time with the voice";
-    voiceBtn.style.color = narrOn ? "var(--hl-rail)" : "";
-    rateWrap.hidden = !narrOn;
-    rateEl.value = String(narrRate);
-    $("rateVal").textContent = (narrRate % 1 ? narrRate.toFixed(2).replace(/0$/, "")
-                                            : narrRate.toFixed(0)) + "\u00d7";
-  }
-
-  voiceBtn.onclick = () => {
-    narrUnblock();
-    if (narrHeld) {                   // a held queue: the click is "try again", not "off"
-      narrHeld = false;
-      ttsFails = 0;
-      setVoiceBtn();
-      narrPump();
-      return;
-    }
-    narrOn = !narrOn;
-    localStorage.setItem("cw.voice", narrOn ? "1" : "0");
-    if (!narrOn) narrStop();
-    setVoiceBtn();
-  };
-  // The rate is a live regulator: a speaking utterance cannot be re-rated in place,
-  // so the current sentence is re-spoken at the new speed and the queue rides along.
-  // While the slider is being dragged, only the readout moves — restarting the voice
-  // on every pixel would stutter.
-  let rateTimer = null;
-  function setRate(v, immediate) {
-    const was = narrRate;
-    narrRate = snapRate(v);
-    if (narrRate === was) { setVoiceBtn(); return; }   // the drag has not left this step
-    localStorage.setItem("cw.rate", String(narrRate));
-    setVoiceBtn();
-    clearTimeout(rateTimer);
-    const apply = () => {
-      if (!narrBusy) return;
-      const rest = narrQ.map((it) => ({ say: it.say, marks: it.marks }));
-      const cur = narrCurrent;
-      narrStop();
-      narrOn = true;
-      if (cur) rest.unshift({ say: cur.say, marks: [] });    // repeat it, do not re-open
-      narrEnqueue(rest);
-    };
-    rateTimer = setTimeout(apply, immediate ? 0 : 260);
-  }
-  rateEl.oninput = () => setRate(Number(rateEl.value), false);
-  rateEl.onchange = () => setRate(Number(rateEl.value), true);
-  document.addEventListener("keydown", (e) => {
-    if (!e.altKey || e.ctrlKey || e.metaKey) return;
-    if (e.key === ",") { e.preventDefault(); setRate(narrRate - RATE_STEP, true); }
-    if (e.key === ".") { e.preventDefault(); setRate(narrRate + RATE_STEP, true); }
-  });
-  setVoiceBtn();
-
-  async function ask(text) {
-    if (busy) return;
-    const q = (text || "").trim();
-    if (!q) return;
-
-    narrStop();
-    const t = tab(active);
-    const sent = refs.slice();
-    let context = "";
-    if (sent.length) {
-      context = "REFERENCES the user attached to this question:\n\n";
-      for (const r of sent) {
-        const head = r.reject
-          ? "--- " + realPath(r.path) + " near line " + r.a
-            + " \u2014 THE USER REJECTED THIS CHANGE OF YOURS ---"
-          : "--- " + realPath(r.path) + " lines " + r.a + "-" + r.b + srcNote(r.path) + " ---";
-        context += head + "\n" + r.text + "\n"
-                 + (r.clipped ? "--- (truncated; read the file for the rest) ---\n" : "")
-                 + "\n";
-      }
-      context = context.trimEnd() + "\n";
-    }
-    if (t) {
-      context += (context ? "\n" : "") + "[The user is looking at " + realPath(t.path) + srcNote(t.path);
-      if (t.sel) context += ", lines " + t.sel.a + "-" + t.sel.b + " selected";
-      context += ".]";
-    }
-
-    const mine = bubble("You", "me");
-    if (sent.length) {
-      const bar = document.createElement("div");
-      bar.className = "refbar";
-      for (const r of sent) bar.appendChild(refChip(r, null));
-      mine.insertBefore(bar, mine.querySelector(".body"));
-    }
-    mine.querySelector(".body").textContent = q;
-    refs = [];
-    renderRefs();
-    const msg = bubble("Claude");
-    msg.classList.add("cell");
-    const acts = document.createElement("div");
-    acts.className = "acts";
-    const out = msg.querySelector(".body");
-    msg.insertBefore(acts, out);
-    out.innerHTML = '<p class="thinking">Thinking</p>';
-    setBusy(true);
-    cellIdx = cells().length - 1;
-    holdPin(msg);
-    syncCellNav();
-    updateJump();
-
-    let acc = "", autoIdx = -1;
-    const narr = { raw: "", el: out, sent: 0 };
-
-    // How much of the answer the reader has asked for. Everything past the current
-    // [[continue:]] is written but not shown, not spoken, and not allowed to move the
-    // pane: the model finishes its thought, the reader walks through it.
-    let shown = 1;
-    const show = () => {
-      const text = revealed(acc, shown);
-      const label = breakLabel(acc, shown);
-      renderReply(out, text);
-      msg.querySelectorAll(".contbar").forEach((b) => b.remove());
-      if (label !== null) {
-        addContinue(msg, label, () => {
-          shown += 1;
-          msg.dataset.shown = String(shown);
-          show();
-          applyPin();
-        });
-      }
-      // A part followed by a break is finished even while the rest still streams, so
-      // the narrator may speak all of it; only the tail of the last part has to wait.
-      narrFeed(narr, text, out, label !== null || !busy);
-      if (!narrOn) {
-        const ds = allDirectives(text);
-        if (follow && ds.length - 1 > autoIdx) {
-          autoIdx = ds.length - 1;
-          openFile(ds[autoIdx].path, ds[autoIdx].spec);
-        }
-        const d = ds[autoIdx];
-        markActiveChip(out, d ? chipKey(d.path, d.spec) : null);
-      }
-    };
-
-    try {
-      const res = await fetch("/api/ask", {
+      res = await fetch(R("send"), {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ q: q, context: context, voice: narrOn }),
-      });
-      const reader = res.body.getReader();
-      const dec = new TextDecoder();
-      let buf = "";
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, { stream: true });
-        const parts = buf.split("\n\n");
-        buf = parts.pop();
-        for (const part of parts) {
-          if (!part.startsWith("data: ")) continue;
-          let ev;
-          try { ev = JSON.parse(part.slice(6)); } catch (e) { continue; }
-          if (ev.k === "delta") {
-            acc += ev.v;
-            const tm = TITLE_RE.exec(acc);
-            if (tm) setCellTitle(msg, (tm[1] || "").trim());
-            show();
-          } else if (ev.k === "tool") {
-            const a = document.createElement("div");
-            a.className = "act"; a.textContent = ev.v;
-            acts.appendChild(a);
-            setBusy(true, "reading");
-          } else if (ev.k === "notice") {
-            const n = document.createElement("p");
-            n.className = "notice"; n.textContent = ev.v;
-            out.appendChild(n);
-          } else if (ev.k === "error") {
-            if (!acc) out.textContent = "";
-            const e = document.createElement("div");
-            e.className = "errline"; e.textContent = ev.v;
-            out.appendChild(e);
-          }
-          applyPin();  // the answer is growing; keep its top where the eye already is
-          updateJump();
-        }
-      }
-      if (acc) {
-        const tm = TITLE_RE.exec(acc);
-        if (tm) setCellTitle(msg, (tm[1] || "").trim());
-        msg.dataset.raw = acc;
-        msg.dataset.shown = "1";
-        addReplay(acts, msg, out);
-        show();
-        if (!narrOn && autoIdx < 0) {
-          const ds = allDirectives(revealed(acc, shown));
-          if (ds.length) {
-            autoIdx = 0;
-            openFile(ds[0].path, ds[0].spec);
-            markActiveChip(out, chipKey(ds[0].path, ds[0].spec));
-          }
-        }
-      }
-    } catch (err) {
-      const e = document.createElement("div");
-      e.className = "errline";
-      e.textContent = "Lost the connection to codewalk. Is the server still running?";
-      out.appendChild(e);
-    } finally {
-      setBusy(false);
-      applyPin();
-      releasePin();
-      syncCellNav();
-      updateJump();
-      show();               // the last part is complete now: release it to the narrator
-      refreshChanges();   // the agent may have edited the branch this turn
+        body: JSON.stringify(payload()),
+      }).then((r) => r.json());
+    } catch (e) { res = null; }
+    if (!res || !res.ok) {
+      btn.disabled = false; btn.textContent = "Send review";
+      flash("Could not reach the server.");
+      return;
     }
+    // Back to the queue. This window is the one you keep open, so a review ending must
+    // return you to the list, not to a dead end telling you to close it.
+    const title = $("titleRoot").textContent;
+    btn.disabled = false;
+    btn.textContent = "Send review";
+    showHome();
+    qnote(n
+      ? "Sent \u2014 " + n + " item" + (n === 1 ? "" : "s") + " on \u201c" + title + "\u201d"
+      : "Sent \u2014 nothing flagged on \u201c" + title + "\u201d");
   }
 
-  sendEl.onclick = () => { const v = boxEl.value; boxEl.value = ""; boxEl.style.height = "auto"; ask(v); };
-  boxEl.addEventListener("keydown", (e) => {
-    if (e.key !== "Enter" || e.shiftKey) return;
-    e.preventDefault();
-    if (!boxEl.value.trim()) {
-      const c = pendingContinue();
-      if (c) { c.click(); return; }
-    }
-    sendEl.click();
+  let noteTimer = 0;
+  function qnote(text) {
+    const el = $("qnote");
+    el.textContent = text;
+    el.hidden = false;
+    clearTimeout(noteTimer);
+    noteTimer = setTimeout(() => { el.hidden = true; }, 8000);
+  }
+
+  $("send").onclick = send;
+  // The same gesture as saving a comment, one level up: finish writing, send the review.
+  $("general").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
   });
-  boxEl.addEventListener("input", () => {
-    boxEl.style.height = "auto";
-    boxEl.style.height = Math.min(boxEl.scrollHeight, 160) + "px";
+  $("general").addEventListener("input", () => {
+    const g = $("general");
+    g.style.height = "auto";
+    g.style.height = Math.min(g.scrollHeight, 140) + "px";
+    renderReview();
+    saveDraft();
   });
+
+  function flash(msg) {
+    $("stState").textContent = msg;
+    setTimeout(() => { $("stState").textContent = "ready"; }, 2500);
+  }
+
+  // ---------------- keys ----------------
   $("filter").addEventListener("input", renderTree);
   document.addEventListener("keydown", (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key === "p") { e.preventDefault(); $("filter").focus(); $("filter").select(); }
-    // Escape shuts the voice up without turning narration off for the next step.
-    if (e.key === "Escape" && narrBusy) { e.preventDefault(); narrStop(); }
+    const typing = /^(TEXTAREA|INPUT)$/.test(document.activeElement.tagName);
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "p") {
+      e.preventDefault(); $("filter").focus(); $("filter").select(); return;
+    }
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "l") {
+      const t = tab(active);
+      if (!t) return;
+      const r = selectedLineRange();
+      e.preventDefault();
+      if (r) {
+        window.getSelection().removeAllRanges();
+        hideFloat();
+        startComment(t, r.a - 1, r.b - 1);
+      } else if (t.sel) {
+        const sel = t.sel;
+        t.sel = null;
+        startComment(t, sel.a - 1, sel.b - 1);
+      }
+      return;
+    }
+    if (e.key === "Escape" && editing) { e.preventDefault(); cancelEdit(); return; }
+
+    // Bare keys, scoped to the editor: a whole review without the mouse. They are off while
+    // you are typing, and off in the tree, where the filter box owns the alphabet.
+    const el = document.activeElement;
+    const live = rid && !typing && !(el && $("explorer").contains(el));
+    if (live && !e.altKey && !e.ctrlKey && !e.metaKey) {
+      const k = e.key.toLowerCase();
+      if ("arcnpuk".indexOf(k) >= 0 && k.length === 1) {
+        e.preventDefault();
+        const t = tab(active);
+        if (k === "n") { gotoWalk(walkIdx + 1); return; }
+        if (k === "p") { gotoWalk(walkIdx - 1); return; }
+        if (k === "u") { undoLast(); return; }
+        // An explicit selection of lines beats everything: you picked those out by hand.
+        if (k === "c" && t) {
+          const r = selectedLineRange();
+          if (r) {
+            window.getSelection().removeAllRanges();
+            hideFloat();
+            startComment(t, r.a - 1, r.b - 1);
+            return;
+          }
+          if (t.sel) {
+            const sel = t.sel; t.sel = null;
+            startComment(t, sel.a - 1, sel.b - 1);
+            return;
+          }
+        }
+        actOnSelected(k);
+        return;
+      }
+    }
+
+    if (!e.altKey || e.ctrlKey || e.metaKey || typing) return;
+    if (e.key === "ArrowLeft") { e.preventDefault(); navGo(-1); }
+    if (e.key === "ArrowRight") { e.preventDefault(); navGo(1); }
+    if (e.key === "ArrowUp") { e.preventDefault(); gotoWalk(walkIdx - 1); }
+    if (e.key === "ArrowDown") { e.preventDefault(); gotoWalk(walkIdx + 1); }
   });
+
+  // a, r and c all act on the selected item, which may not be in the file on screen — you
+  // can wander off with the tabs or the tree. Going there first is what makes the three keys
+  // mean the same thing wherever you are standing.
+  async function actOnSelected(k) {
+    const tg = keyTarget();
+    const verb = k === "r" ? "reject" : k === "c" ? "comment on" : "approve";
+    if (!tg) { flash("nothing selected to " + verb); return; }
+    let t = tab(active);
+    if (!t || t.rel !== tg.path) {
+      await gotoWalk(walkIdx >= 0 ? walkIdx : 0);
+      t = tab(active);
+      if (!t || t.rel !== tg.path) { flash("could not open " + shortPath(tg.path)); return; }
+    }
+    if (k !== "c") {
+      setVerdict(tg, k === "r" ? "reject" : "approve", t);
+      return;
+    }
+    const a = tg.a ? rowOf(t, tg.a) : 0;
+    const b = tg.b ? rowOf(t, tg.b) : 0;
+    startComment(t, a < 0 ? 0 : a, b < 0 ? (a < 0 ? 0 : a) : b, tg.stop, null, tg.key);
+  }
 
   // ---------------- sashes ----------------
   function makeSash(sash, pane, side) {
@@ -3949,92 +2872,189 @@ textarea:focus { outline: none; border-color: var(--accent); }
     } catch (err) {}
   }
   makeSash($("sash1"), $("explorer"), "left");
-  makeSash($("sash2"), $("chat"), "right");
+  makeSash($("sash2"), $("review"), "right");
 
-  // ---------------- sync to the terminal session ----------------
-  // One-way the other way: publish what was said here so the terminal Claude can pick it up.
-  function setupSync() {
-    const bar = $("syncbar"), now = $("syncNow"), close = $("syncClose");
-    bar.hidden = false;
-    const note = document.createElement("span");
-    note.id = "syncnote";
-    bar.appendChild(note);
-
-    async function push(closing) {
-      now.disabled = close.disabled = true;
-      note.style.color = "";
-      note.textContent = closing ? "Syncing and closing\u2026" : "Syncing\u2026";
-      let res = null;
-      try {
-        res = await fetch("/api/sync", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ close: !!closing }),
-        }).then((r) => r.json());
-      } catch (e) {
-        res = { ok: false, error: "Could not reach the server." };
-      }
-      if (closing && res && res.ok) {
-        document.body.innerHTML =
-          "<div style='padding:60px;font-family:system-ui;color:#858585;font-size:14px;line-height:1.7'>" +
-          "Synced to the terminal \u2014 " + res.synced + " exchange(s) sent. You can close this tab.</div>";
-        return;
-      }
-      now.disabled = close.disabled = false;
-      if (res && res.ok) {
-        note.style.color = "var(--green)";
-        note.textContent = "sent " + res.synced;
-        setTimeout(() => { note.textContent = ""; }, 4000);
-      } else {
-        note.style.color = "var(--red)";
-        note.textContent = (res && res.error) || "sync failed";
-      }
-    }
-
-    now.onclick = () => push(false);
-    close.onclick = () => push(true);
-    document.addEventListener("keydown", (e) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); push(false); }
-    });
+  // ---------------- the queue, and opening one review from it ----------------
+  // The dashboard outlives every review in it, so the page has two states and a lot of
+  // per-review state to throw away between them. Doing that in one place is the only way
+  // the second review you open behaves like the first.
+  function resetReview() {
+    openTabs = []; active = null;
+    allFiles = []; chgItems = []; chgByPath = new Map(); chgBase = "";
+    stops = []; curStop = -1; walkIdx = -1; prefetched = false;
+    comments = []; verdicts.clear(); diffCache.clear(); undoLog.length = 0;
+    hist = []; hIdx = -1; editing = null;
+    codeEl.textContent = ""; $("tabs").textContent = ""; $("tree").textContent = "";
+    $("brief").textContent = ""; $("stops").textContent = ""; $("loose").textContent = "";
+    $("general").value = ""; $("crumbs").textContent = "";
+    $("send").disabled = false; $("send").textContent = "Send review";
+    $("empty").hidden = false;
+    $("empty").textContent = "Nothing open yet.";
+    $("stFile").textContent = "no file"; $("stPos").textContent = "";
+    updateNav();
   }
 
-  // ---------------- boot ----------------
-  fetch("/api/tree").then((r) => r.json()).then((d) => {
-    allFiles = d.files;
-    $("titleRoot").textContent = d.root + (d.context ? "   \u2014   " + d.context : "");
-    $("expName").textContent = d.name;
-    if (d.handoff) {
-      const hb = $("handback");
-      hb.hidden = false;
-      hb.title = "Close this and hand the conversation back to the terminal";
-      hb.onclick = async () => {
-        hb.disabled = true;
-        hb.textContent = "Handing back\u2026";
-        try { await fetch("/api/handback", { method: "POST" }); } catch (e) {}
-        document.body.innerHTML =
-          "<div style='padding:60px;font-family:system-ui;color:#858585;font-size:14px;line-height:1.7'>" +
-          "Handed back to the terminal. Everything said here has gone with you \u2014 " +
-          "you can close this tab.</div>";
-      };
+  function showHome() {
+    rid = null;
+    $("home").hidden = false;
+    $("work").hidden = true;
+    $("status").hidden = true;
+    $("back").hidden = true;
+    $("titleRoot").textContent = "dashboard";
+    $("titleBase").textContent = "";
+    document.title = "codewalk";
+    refreshQueue();
+  }
+
+  function ago(secs) {
+    if (secs < 60) return secs + "s ago";
+    if (secs < 3600) return Math.round(secs / 60) + "m ago";
+    return Math.round(secs / 3600) + "h ago";
+  }
+
+  let queue = [];
+
+  async function refreshQueue() {
+    let d = null;
+    try { d = await fetch("/api/queue").then((r) => r.json()); }
+    catch (e) { return; }
+    // The server has been restarted with different code since this tab loaded. Drafts live
+    // on the server, so nothing is lost by reloading — but not out from under a review in
+    // progress, where it would be startling.
+    if (d.stamp && d.stamp !== STAMP) {
+      if (!rid) { location.reload(); return; }
+      $("titleBase").textContent = "dashboard updated \u2014 reload when you finish";
     }
-    if (d.handoff) setInterval(() => { fetch("/api/ping").catch(() => {}); }, 3000);
-    setupCells();
-    ttsOK = !!d.tts;
-    ttsServer = !!d.tts;
-    if (!ttsOK && !synth) { narrOn = false; voiceBtn.hidden = true; }
-    setVoiceBtn();
-    setupModel(d.model, d.models);
-    setupChanges();
-    if (d.sync) setupSync();
+    queue = (d.pending || []).concat(d.stale || []);
+    const list = $("qlist");
+    list.textContent = "";
+    queue.forEach((c, i) => list.appendChild(qcard(c, i)));
+    $("qempty").hidden = queue.length > 0;
+    // The tab is the notification: a count in the title is the whole of it, and it is the
+    // one thing you can see while this window is behind your editor.
+    if (!rid) {
+      const n = (d.pending || []).length;
+      document.title = n ? "codewalk (" + n + ")" : "codewalk";
+    }
+  }
+
+  function qcard(c, i) {
+    const el = document.createElement("button");
+    el.className = "qcard" + (c.state === "gone" ? " stale" : "");
+    const n = document.createElement("span");
+    n.className = "n"; n.textContent = i < 9 ? String(i + 1) : "";
+    const t = document.createElement("span");
+    t.className = "t"; t.textContent = c.title;
+    const m = document.createElement("span");
+    m.className = "m";
+    m.textContent = c.repo + (c.state === "gone" ? "  \u00b7  agent gone" : "");
+    el.append(n, t, m);
+    el.onclick = () => openReview(c.id);
+    return el;
+  }
+
+  async function openReview(id) {
+    resetReview();
+    rid = id;
+    let d = null;
+    try { d = await fetch(R("")).then((r) => r.json()); }
+    catch (e) { showHome(); return; }
+    if (d.error) { showHome(); return; }
+
+    $("home").hidden = true;
+    $("work").hidden = false;
+    $("status").hidden = false;
+    $("back").hidden = false;
+    $("titleRoot").textContent = d.title;
+    document.title = d.title + " — codewalk";
+
+    allFiles = d.files || [];
+    chgItems = d.changes || [];
+    chgBase = d.base || "";
+    chgByPath = new Map(chgItems.map((e) => [e.path, e]));
+    stops = (d.review && d.review.stops) || [];
+    $("titleBase").textContent = (d.name || "") + (chgBase ? "  vs " + chgBase : "");
+    $("expName").textContent = d.name;
+
+    // What you had already said about this one, if you have been here before. Leaving puts
+    // a review back on the pile, and a pile you cannot step away from is not a queue.
+    const draft = d.draft || {};
+    for (const v of (draft.verdicts || [])) {
+      if (v && v.key) verdicts.set(v.key, v);
+    }
+    for (const c of (draft.items || [])) {
+      if (!c || !c.key) continue;
+      comments.push(Object.assign({}, c, {
+        id: nextId++, view: viewFor(c.path), rowA: -1, rowB: -1, data: null,
+      }));
+    }
+    $("general").value = draft.general || "";
+
+    const brief = $("brief");
+    const text = (d.review && d.review.brief) || "";
+    if (text) prose(brief, text);
+    else {
+      const p = document.createElement("div");
+      p.className = "dimnote";
+      p.textContent = stops.length
+        ? "No brief \u2014 start at stop 1."
+        : "No notes. Everything that differs from " + (chgBase || "the base")
+          + " is listed below; select lines and press Ctrl+L to comment.";
+      brief.appendChild(p);
+    }
+    if (!d.waiting) {
+      const warn = document.createElement("div");
+      warn.className = "probs";
+      warn.textContent = "\u26a0 The agent that asked for this has stopped waiting. "
+                       + "Anything you send will not reach it.";
+      brief.appendChild(warn);
+    }
+    const probs = (d.review && d.review.problems) || [];
+    if (probs.length) {
+      const box = document.createElement("div");
+      box.className = "probs";
+      for (const p of probs) {
+        const l = document.createElement("div");
+        l.textContent = "\u26a0 " + p;
+        box.appendChild(l);
+      }
+      brief.appendChild(box);
+    }
+
     renderTree();
-    const b = bubble("Claude").querySelector(".body");
-    b.innerHTML =
-      (d.context
-        ? "<p>Picking up from our terminal session \u2014 I already have the context of what we built here.</p>"
-        : "<p>Ask me anything about <code>" + d.name + "</code>. I will read whatever files I need and " +
-          "open them in the center pane, on the lines I am talking about.</p>") +
-      "<p class='notice'>Click a chip in my answer to jump there. Drag the line-number gutter or select code and press Ctrl-L to attach it to a question. Ctrl-P filters the tree.</p>";
-    if (d.first_question) ask(d.first_question);
+    renderReview();
+    // You land where the agent wants you looking. The rest of the diffs stream in behind
+    // it, so the first stop is on screen while they arrive.
+    if (stops.length) await gotoWalk(0);
+    else if (chgItems.length) await openFile(CHG + chgItems[0].path);
+    else $("empty").textContent = "Nothing differs from " + (chgBase || "the base") + ".";
+    await prefetchDiffs();
+    if (!stops.length) gotoWalk(0);
+  }
+
+  // Leaving without sending puts it back on the pile rather than holding it open.
+  async function leaveReview() {
+    if (rid) { try { await fetch(R("defer"), { method: "POST" }); } catch (e) {} }
+    showHome();
+  }
+
+  $("back").onclick = leaveReview;
+  document.addEventListener("keydown", (e) => {
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (/^(TEXTAREA|INPUT)$/.test(document.activeElement.tagName)) return;
+    if (!rid) {
+      // On the queue, the numbers open things. Nothing else there needs a key.
+      if (e.key >= "1" && e.key <= "9") {
+        const c = queue[Number(e.key) - 1];
+        if (c) { e.preventDefault(); openReview(c.id); }
+      }
+      return;
+    }
+    if (e.key === "Escape" && !editing) { e.preventDefault(); leaveReview(); }
   });
+
+  setInterval(refreshQueue, 2500);
+  showHome();
 })();
 </script>
 </body>
@@ -4042,202 +3062,192 @@ textarea:focus { outline: none; border-color: var(--accent); }
 """
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Local three-pane workspace for talking about code.")
-    ap.add_argument("root", nargs="?", default=".", help="project root (default: .)")
-    ap.add_argument("--port", type=int, default=8765)
-    ap.add_argument("--model", default="opus", help="alias passed to `claude --model`")
-    ap.add_argument("--demo", nargs="?", const="", metavar="SCRIPT",
-                    help="serve canned answers from a script file instead of calling the "
-                         "model, for working on the page itself (default: "
-                         "demo-walkthrough.md next to codewalk.py)")
-    ap.add_argument(
-        "--resume", metavar="SESSION", nargs="?", const="latest", default=None,
-        help="start the chat from an existing Claude Code session so it already knows what you "
-             "built together. A session id, or 'latest' (the default when the flag is bare) for "
-             "the most recent session in --context-dir. The original is forked, never modified.",
-    )
-    ap.add_argument(
-        "--context-dir", default=None, metavar="DIR",
-        help="directory whose sessions '--resume latest' searches (default: the current directory)",
-    )
-    ap.add_argument(
-        "--handoff", action="store_true",
-        help="block until you press 'Return to terminal' in the page, then print the whole "
-             "dashboard conversation to stdout so the calling session absorbs it. Implies --resume.",
-    )
-    ap.add_argument(
-        "--transcript", metavar="PATH", default=None,
-        help="write the running transcript here (default: alongside the log in /tmp)",
-    )
-    ap.add_argument("--wait", type=int, default=570, metavar="SECONDS",
-                    help="how long --handoff blocks before giving up (default 570)")
-    ap.add_argument("--brief", default="", metavar="TEXT",
-                    help="instructions for the dashboard session: what to walk through and how")
-    ap.add_argument("--brief-file", default=None, metavar="PATH",
-                    help="a file of instructions for the dashboard session (added to --brief)")
-    ap.add_argument("--start", default="", metavar="QUESTION",
-                    help="ask this the moment the page opens, so the conversation starts by itself")
-    ap.add_argument("--sync-file", default=None, metavar="PATH",
-                    help="show Sync buttons that publish the conversation to PATH, for a terminal "
-                         "session to pick up. Works with or without --handoff.")
-    ap.add_argument("--idle-exit", type=int, default=15, metavar="SECONDS",
-                    help="with --handoff, return to the terminal this long after the tab is closed")
-    ap.add_argument("--base", default=None, metavar="REF",
-                    help="the branch or commit this work grew out of. The Changes pane lists "
-                         "everything different from the merge-base with it, committed or not "
-                         "(default: main, then master, then nothing)")
-    ap.add_argument("--worktree", default=None, metavar="TOPIC",
-                    help="work on a scratch branch in a git worktree instead of in ROOT itself. "
-                         "TOPIC names the branch (codewalk/TOPIC unless it already has a slash); "
-                         "an existing branch is reused. Nothing written there touches ROOT until "
-                         "you merge it")
-    ap.add_argument("--worktree-dir", default=None, metavar="DIR",
-                    help="where to put the worktree "
-                         "(default: ~/.cache/codewalk/trees/<repo>-<hash>/<branch>)")
-    ap.add_argument("--no-carry", action="store_true",
-                    help="start the worktree at the last commit only. By default your "
-                         "uncommitted work is carried over too, so the branch opens in the "
-                         "state your checkout is actually in")
-    ap.add_argument("--carry-max", type=int, default=1 << 20, metavar="BYTES",
-                    help="skip untracked files bigger than this when carrying (default 1 MiB). "
-                         "Tracked edits ride over as a patch and are never subject to it")
-    ap.add_argument("--no-open", action="store_true")
-    args = ap.parse_args()
-    if args.handoff and not args.resume:
-        args.resume = "latest"
+# ----------------------------------------------------------------------------------
+# the two sides: the dashboard you leave open, and what an agent calls
+# ----------------------------------------------------------------------------------
 
-    if not os.path.isdir(args.root):
-        sys.exit(f"codewalk: not a directory: {args.root}")
+DEFAULT_PORT = int(os.environ.get("CODEWALK_PORT") or 8765)
 
-    parent = None
-    if args.resume:
-        ctx = args.context_dir or os.getcwd()
-        parent = find_session(args.resume, ctx)
-        if parent is None:
-            sys.exit(f"codewalk: no Claude Code session found for {os.path.abspath(ctx)}")
-        Handler.context_label = "forked from " + parent[:8]
 
-    brief = args.brief
-    if args.brief_file:
+def api(port: int, path: str, payload=None, timeout: float = 70.0) -> dict:
+    url = f"http://127.0.0.1:{port}{path}"
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"},
+        method="POST" if data is not None else "GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
         try:
-            with open(args.brief_file, encoding="utf-8") as fh:
-                brief = (brief + "\n\n" + fh.read()).strip()
-        except OSError as e:
-            sys.exit(f"codewalk: could not read --brief-file: {e}")
+            return json.loads(e.read().decode("utf-8"))
+        except Exception:
+            return {"error": f"HTTP {e.code}"}
 
-    # The worktree is made before anything reads the tree: from here down, "the repo" is
-    # the scratch checkout, and the user's own is only ever the thing it forked from.
-    tree, carried = None, None
-    if args.worktree:
-        branch = args.worktree if "/" in args.worktree else "codewalk/" + args.worktree
-        tree = Worktree(args.root, branch, args.worktree_dir)
-        tree.open()
-        Handler.tree = tree
-        # Only into a tree we just made. Replaying the source's working state onto a branch
-        # that already has its own history would overwrite work nobody asked us to touch.
-        if tree.dirty and not tree.attached and not args.no_carry:
-            carried = tree.carry(args.carry_max)
 
-    Handler.first_question = args.start
-    Handler.sync_path = os.path.abspath(args.sync_file) if args.sync_file else None
-    Handler.repo = Repo(tree.path if tree else args.root)
-    Handler.changes = Changes(
-        Handler.repo,
-        args.base or (tree.base_ref if tree else None),
-        # On a fresh branch that commit IS their carried work; on a re-attach it is
-        # whatever codewalk last pinned there, which may have been an Accept.
-        name=("" if (args.base or not tree or not tree.carried)
-              else "last sync" if tree.attached else "your work at launch"),
-    )
-    if args.demo is not None:
-        script = args.demo or os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                           "demo-walkthrough.md")
-        try:
-            Handler.claude = Script(script)
-        except OSError as e:
-            sys.exit(f"codewalk: could not read --demo script: {e}")
-        Handler.models = ["demo"]
-    else:
-        Handler.claude = Claude(args.model, Handler.repo.root, parent, brief)
-        Handler.models = MODELS + ([args.model] if args.model not in MODELS else [])
-    Handler.voice = Voice(*find_piper())
-    n = len(Handler.repo.files())
+def no_dashboard(port: int) -> str:
+    return (f"codewalk: no dashboard listening on port {port}.\n"
+            f"          start one with:  codewalk.py serve --port {port}")
 
-    httpd = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+
+def cmd_serve(args) -> int:
+    Handler.queue = Queue()
+    try:
+        httpd = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    except OSError as e:
+        sys.exit(f"codewalk: could not listen on port {args.port}: {e}")
     url = f"http://127.0.0.1:{args.port}/"
-    print(f"codewalk  {Handler.repo.root}  ({n} files{', git' if Handler.repo.is_git else ''})")
-    print(f"          {url}   (ctrl-c to stop)")
-    if tree:
-        verb = "on existing branch" if tree.attached else "new branch"
-        print(f"          worktree {verb} {tree.branch}, forked from {tree.source_ref}")
-        if carried:
-            n = carried["patched"] + carried["copied"]
-            print(f"          carried over {n} uncommitted path(s) from {tree.source}, "
-                  f"which stays untouched")
-            for rel, why in carried["skipped"]:
-                print(f"          NOT carried: {rel} — {why}")
-        elif tree.dirty and tree.attached:
-            print(f"          note: {tree.dirty} uncommitted path(s) in {tree.source} are NOT "
-                  f"here — this branch already existed, so its own state was kept")
-        elif tree.dirty:
-            print(f"          note: {tree.dirty} uncommitted path(s) in {tree.source} are NOT "
-                  f"here (--no-carry)")
-        for hint in tree.hints():
-            print(f"          {hint}")
-    if parent:
-        print(f"          chat forks session {parent} (your original is not modified)")
-    if Handler.sync_path:
-        print(f"          sync button writes {Handler.sync_path}")
+    print(f"codewalk dashboard  {url}")
+    print("          waiting for agents to submit reviews (ctrl-c to stop)")
     if lex is None:
         print("          note: Pygments not found — showing plain text")
+    print(flush=True)
     if not args.no_open:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
-
-    if not args.handoff:
-        try:
-            httpd.serve_forever()
-        except KeyboardInterrupt:
-            print("\ncodewalk: stopped")
-        return
-
-    # Handoff: block here so the terminal conversation pauses, then hand back everything
-    # that was said in the page by printing it — the caller's next tool result IS the transcript.
-    Handler.handoff = True
-    Handler.transcript_path = args.transcript or f"/tmp/codewalk-{args.port}.md"
-    print(f"          waiting for you in the browser — press 'Return to terminal' when done")
-    print(f"          (transcript: {Handler.transcript_path})", flush=True)
-
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    returned, why = False, ""
-    deadline = time.time() + args.wait
     try:
-        while time.time() < deadline:
-            if Handler.handback.wait(timeout=1.0):
-                returned, why = True, "you pressed Return to terminal"
-                break
-            if Handler.last_ping:
-                idle = time.time() - Handler.last_ping
-                if idle > args.idle_exit:
-                    returned, why = True, "the dashboard tab was closed"
-                    break
+        httpd.serve_forever()
     except KeyboardInterrupt:
-        returned, why = True, "interrupted at the terminal"
-    httpd.shutdown()
+        print("\ncodewalk: dashboard stopped")
+    return 0
 
+
+def cmd_submit(args) -> int:
+    root = os.path.abspath(args.root)
+    if not os.path.isdir(root):
+        sys.exit(f"codewalk: not a directory: {root}")
+    notes = ""
+    if args.notes:
+        try:
+            with open(args.notes, encoding="utf-8", errors="replace") as fh:
+                notes = fh.read()
+        except OSError as e:
+            sys.exit(f"codewalk: could not read --notes: {e}")
+
+    try:
+        res = api(args.port, "/api/submit", {
+            "title": args.title, "root": root, "notes": notes,
+            "base": args.base, "agent": args.agent,
+        }, timeout=30)
+    except (urllib.error.URLError, OSError):
+        sys.exit(no_dashboard(args.port))
+    if not res.get("ok"):
+        sys.exit("codewalk: the dashboard refused the review: "
+                 + str(res.get("error") or "unknown reason"))
+
+    print(f"codewalk: submitted {res['id']} — \"{res['title']}\"")
+    print(f"          {res['files']} changed path(s), {res['stops']} stop(s), "
+          f"vs {res['base'] or 'the base'}")
+    print(f"          waiting in the dashboard at http://127.0.0.1:{args.port}/", flush=True)
+    return wait_for(args.port, res["id"], args.wait)
+
+
+def cmd_wait(args) -> int:
+    return wait_for(args.port, args.id, args.wait)
+
+
+def wait_for(port: int, rid: str, limit: int) -> int:
+    """Hold the agent here until the review comes back.
+
+    A chain of short polls rather than one long one: a connection held open for an hour is
+    at the mercy of everything between here and the socket, and this way a dashboard that
+    goes away is noticed within half a minute instead of never.
+    """
+    deadline = time.time() + limit
+    while time.time() < deadline:
+        try:
+            res = api(port, f"/api/wait?id={urllib.parse.quote(rid)}&for=25", timeout=40)
+        except (urllib.error.URLError, OSError):
+            print()
+            print("=" * 72)
+            print("REVIEW LOST — the dashboard is no longer listening")
+            print("=" * 72)
+            print()
+            print(no_dashboard(port))
+            return 4
+        state = res.get("state")
+        if state == "answered":
+            print()
+            print("=" * 72)
+            print("REVIEW RETURNED — it was sent from the dashboard")
+            print("=" * 72)
+            print()
+            print(res.get("text") or "(empty)")
+            return 0
+        if state == "unknown":
+            print()
+            print("=" * 72)
+            print(f"REVIEW {rid} IS NOT IN THE QUEUE — the dashboard was restarted")
+            print("=" * 72)
+            return 4
     print()
     print("=" * 72)
-    if returned:
-        print(f"RETURNED FROM DASHBOARD — {why}")
-    else:
-        print("STILL IN THE DASHBOARD (wait expired) — transcript so far; re-run to keep waiting")
+    print(f"STILL WAITING — nothing sent within {limit}s")
     print("=" * 72)
     print()
-    print(TRANSCRIPT_NOTE)
-    print(render_transcript(Handler.transcript))
-    if not returned:
-        sys.exit(3)
+    print(f"The review is still in the dashboard. Re-attach with:\n"
+          f"    codewalk.py wait {rid} --port {port}")
+    return 3
+
+
+def page_stamp() -> str:
+    """A fingerprint of the page this process serves.
+
+    The dashboard is meant to stay open for days while this program is restarted under it,
+    and a tab holding yesterday's JavaScript against today's server looks exactly like a
+    bug in the UI — which it was, twice. The page carries its own stamp and reloads itself
+    when the one the server reports stops matching.
+    """
+    global _STAMP
+    if not _STAMP:
+        _STAMP = hashlib.sha256(PAGE.encode("utf-8")).hexdigest()[:10]
+    return _STAMP
+
+
+_STAMP = ""
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="A dashboard agents submit code reviews to, and the client they "
+                    "submit with.")
+    subs = ap.add_subparsers(dest="cmd")
+
+    s = subs.add_parser("serve", help="run the dashboard (leave this open)")
+    s.add_argument("--port", type=int, default=DEFAULT_PORT)
+    s.add_argument("--no-open", action="store_true")
+    s.set_defaults(fn=cmd_serve)
+
+    s = subs.add_parser("submit", help="submit a review and block until it comes back")
+    s.add_argument("--title", required=True,
+                   help="what this change IS, in a few words — it is what the dashboard "
+                        'list shows, e.g. "residual MLP architecture"')
+    s.add_argument("--notes", default=None, metavar="PATH",
+                   help="the notes file: a brief, then one `## path:lines  title` heading "
+                        "per stop, in the order they should be read")
+    s.add_argument("--root", default=".", help="the repository being reviewed (default: .)")
+    s.add_argument("--base", default=None, metavar="REF",
+                   help="what the diff is measured against (default: HEAD)")
+    s.add_argument("--agent", default="", metavar="NAME",
+                   help="who is asking, when several of you are working at once")
+    s.add_argument("--wait", type=int, default=3600, metavar="SECONDS",
+                   help="give up after this long (default 3600). The review stays in the "
+                        "dashboard either way")
+    s.add_argument("--port", type=int, default=DEFAULT_PORT)
+    s.set_defaults(fn=cmd_submit)
+
+    s = subs.add_parser("wait", help="re-attach to a review already in the dashboard")
+    s.add_argument("id")
+    s.add_argument("--wait", type=int, default=3600, metavar="SECONDS")
+    s.add_argument("--port", type=int, default=DEFAULT_PORT)
+    s.set_defaults(fn=cmd_wait)
+
+    args = ap.parse_args()
+    if not getattr(args, "fn", None):
+        ap.print_help()
+        return 2
+    return args.fn(args)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
